@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <RootNamespace>AccessControl.Api</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AccessControl.Application\AccessControl.Application.csproj" />
+    <ProjectReference Include="..\AccessControl.Infrastructure\AccessControl.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Swagger UI, registered in Development only (see OpenApi/SwaggerSetup.cs). -->
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.9.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AccessControl.Tests" />
+  </ItemGroup>
+
+</Project>

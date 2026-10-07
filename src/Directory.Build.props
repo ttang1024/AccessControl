@@ -1,0 +1,7 @@
+<Project>
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+  <PropertyGroup>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+</Project>

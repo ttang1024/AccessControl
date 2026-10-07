@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>AccessControl.Domain</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AccessControl.Tests" />
+  </ItemGroup>
+
+</Project>

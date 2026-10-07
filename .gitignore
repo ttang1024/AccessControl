@@ -1,0 +1,10 @@
+bin/
+obj/
+*.user
+.vs/
+.idea/
+TestResults/
+CLAUDE.md
+# Runtime data written by the API (store.json, access-events.jsonl)
+data/
+data-dev/
