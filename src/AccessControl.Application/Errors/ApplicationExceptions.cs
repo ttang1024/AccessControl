@@ -1,5 +1,14 @@
 namespace AccessControl.Application.Errors;
 
+/// <summary>
+/// The request itself is malformed (e.g. paging out of range), as opposed to breaking a domain rule
+/// (<c>DomainException</c>). Maps to HTTP 400.
+/// </summary>
+public sealed class RequestValidationException(string code, string message) : Exception(message)
+{
+    public string Code { get; } = code;
+}
+
 /// <summary>A referenced resource does not exist. Maps to HTTP 404.</summary>
 public sealed class NotFoundException(string resource, Guid id)
     : Exception($"{resource} '{id}' was not found.")

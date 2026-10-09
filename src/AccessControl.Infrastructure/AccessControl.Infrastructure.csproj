@@ -4,8 +4,9 @@
     <RootNamespace>AccessControl.Infrastructure</RootNamespace>
   </PropertyGroup>
 
+  <!-- Adapters need storage, options and health-check abstractions only, not the ASP.NET Core framework. -->
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="8.0.11" />
   </ItemGroup>
 
   <ItemGroup>

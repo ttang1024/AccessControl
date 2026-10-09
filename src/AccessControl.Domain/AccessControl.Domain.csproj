@@ -4,8 +4,4 @@
     <RootNamespace>AccessControl.Domain</RootNamespace>
   </PropertyGroup>
 
-  <ItemGroup>
-    <InternalsVisibleTo Include="AccessControl.Tests" />
-  </ItemGroup>
-
 </Project>

@@ -30,6 +30,22 @@ public sealed class ApiSecurityTests : IAsyncLifetime, IDisposable
     }
 
     [Fact]
+    public async Task Invalid_paging_is_a_bad_request_with_a_stable_code()
+    {
+        var response = await _api.Client(ApiFactory.AdminKey).GetAsync("/api/v1/cardholders?limit=0");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("limit.invalid", (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Liveness_is_anonymous_and_runs_no_checks()
+    {
+        var response = await _api.Client(apiKey: null).GetAsync("/health/live");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
     public async Task Health_is_anonymous()
     {
         var response = await _api.Client(apiKey: null).GetAsync("/health");
@@ -152,6 +168,19 @@ public sealed class ApiRateLimitTests
 
         Assert.Equal([HttpStatusCode.Unauthorized, HttpStatusCode.Unauthorized, HttpStatusCode.TooManyRequests], statuses);
     }
+
+    [Fact]
+    public async Task Bad_key_traffic_does_not_use_up_the_health_budget()
+    {
+        using var api = new ApiFactory(new() { ["RateLimiting:AnonymousPermitsPerMinute"] = "2" });
+        var guesser = api.Client("wrong-key");
+        for (var i = 0; i < 3; i++)
+        {
+            await guesser.GetAsync("/api/v1/doors");
+        }
+
+        Assert.Equal(HttpStatusCode.OK, (await api.Client(apiKey: null).GetAsync("/health")).StatusCode);
+    }
 }
 
 public sealed class ApiStartupValidationTests
@@ -175,6 +204,17 @@ public sealed class ApiStartupValidationTests
         using var api = new ApiFactory(new() { ["Auth:ApiKeys:2:Role"] = "DoorController" });
         var ex = Assert.ThrowsAny<Exception>(() => api.Client(apiKey: null));
         Assert.Contains("must list the door ids", ex.ToString(), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("Storage:AuditHmacKey", null, "Storage:AuditHmacKey must be set")]
+    [InlineData("Storage:AuditHmacKey", "too-short", "Storage:AuditHmacKey must be set")]
+    [InlineData("AllowedHosts", "*", "AllowedHosts must list the real host name(s)")]
+    public void Weak_production_settings_stop_startup(string key, string? value, string expected)
+    {
+        using var api = new ApiFactory(new() { [key] = value });
+        var ex = Assert.ThrowsAny<Exception>(() => api.Client(apiKey: null));
+        Assert.Contains(expected, ex.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]

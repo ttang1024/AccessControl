@@ -6,6 +6,7 @@ using AccessControl.Application.Cardholders;
 using AccessControl.Application.Credentials;
 using AccessControl.Application.Doors;
 using AccessControl.Application.Schedules;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -14,10 +15,17 @@ namespace AccessControl.Application;
 public static class DependencyInjection
 {
     /// <summary>Registers application services. Persistence ports must be registered by an infrastructure module.</summary>
-    public static IServiceCollection AddAccessControlApplication(this IServiceCollection services)
+    public static IServiceCollection AddAccessControlApplication(
+        this IServiceCollection services, IConfiguration configuration)
     {
         services.TryAddSingleton(TimeProvider.System);
         services.TryAddSingleton<IActorContext, SystemActor>();
+
+        services.AddOptions<AuditQueryOptions>()
+            .Bind(configuration.GetSection(AuditQueryOptions.SectionName))
+            .Validate(o => o.DefaultDays > 0, "AuditQuery:DefaultDays must be positive.")
+            .ValidateOnStart();
+        services.AddSingleton<AuditQueryWindow>();
 
         services.AddScoped<CardholderService>();
         services.AddScoped<CredentialService>();

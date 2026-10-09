@@ -1,5 +1,6 @@
 using AccessControl.Application.Abstractions;
 using AccessControl.Application.Cardholders;
+using AccessControl.Application.Errors;
 using AccessControl.Domain.AccessGroups;
 
 namespace AccessControl.Application.AccessGroups;
@@ -18,13 +19,13 @@ public sealed class AccessGroupService(
     ICardholderRepository cardholders,
     IUnitOfWork unitOfWork)
 {
-    private const string Resource = "AccessGroup";
+    private const string Resource = ResourceNames.AccessGroup;
 
     public async Task<AccessGroupView> CreateAsync(AccessGroupRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
         var group = AccessGroup.Create(Guid.NewGuid(), request.Name, request.ScheduleId);
-        await schedules.GetRequiredAsync(request.ScheduleId, "Schedule", ct).ConfigureAwait(false);
+        await schedules.GetRequiredAsync(request.ScheduleId, ResourceNames.Schedule, ct).ConfigureAwait(false);
 
         accessGroups.Add(group);
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
@@ -34,20 +35,24 @@ public sealed class AccessGroupService(
     public async Task<AccessGroupView> GetAsync(Guid id, CancellationToken ct) =>
         AccessGroupView.From(await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
 
-    public async Task<IReadOnlyList<AccessGroupView>> ListAsync(CancellationToken ct) =>
-        (await accessGroups.ListAsync(ct).ConfigureAwait(false))
-            .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(AccessGroupView.From)
-            .ToList();
+    public async Task<PagedResult<AccessGroupView>> ListAsync(PageRequest page, CancellationToken ct) =>
+        PagedResult.Create(
+            (await accessGroups.ListAsync(ct).ConfigureAwait(false))
+                .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(g => g.Id)
+                .Select(AccessGroupView.From),
+            page);
 
-    public async Task<IReadOnlyList<CardholderView>> ListMembersAsync(Guid id, CancellationToken ct)
+    public async Task<PagedResult<CardholderView>> ListMembersAsync(Guid id, PageRequest page, CancellationToken ct)
     {
         await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        return (await cardholders.ListByAccessGroupAsync(id, ct).ConfigureAwait(false))
-            .OrderBy(c => c.LastName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(c => c.FirstName, StringComparer.OrdinalIgnoreCase)
-            .Select(CardholderView.From)
-            .ToList();
+        return PagedResult.Create(
+            (await cardholders.ListByAccessGroupAsync(id, ct).ConfigureAwait(false))
+                .OrderBy(c => c.LastName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(c => c.FirstName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(c => c.Id)
+                .Select(CardholderView.From),
+            page);
     }
 
     public async Task<AccessGroupView> UpdateAsync(Guid id, AccessGroupRequest request, CancellationToken ct)
@@ -56,7 +61,7 @@ public sealed class AccessGroupService(
         var group = await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
         group.Rename(request.Name);
         group.ChangeSchedule(request.ScheduleId);
-        await schedules.GetRequiredAsync(request.ScheduleId, "Schedule", ct).ConfigureAwait(false);
+        await schedules.GetRequiredAsync(request.ScheduleId, ResourceNames.Schedule, ct).ConfigureAwait(false);
 
         accessGroups.Update(group);
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
@@ -66,15 +71,17 @@ public sealed class AccessGroupService(
     public async Task<AccessGroupView> AddDoorAsync(Guid id, Guid doorId, CancellationToken ct)
     {
         var group = await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        await doors.GetRequiredAsync(doorId, "Door", ct).ConfigureAwait(false);
-        return await SaveIfChangedAsync(group, group.AddDoor(doorId), ct).ConfigureAwait(false);
+        await doors.GetRequiredAsync(doorId, ResourceNames.Door, ct).ConfigureAwait(false);
+        group.AddDoor(doorId);
+        accessGroups.Update(group);
+        await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
+        return AccessGroupView.From(group);
     }
 
-    public async Task<AccessGroupView> RemoveDoorAsync(Guid id, Guid doorId, CancellationToken ct)
-    {
-        var group = await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        return await SaveIfChangedAsync(group, group.RemoveDoor(doorId), ct).ConfigureAwait(false);
-    }
+    public async Task<AccessGroupView> RemoveDoorAsync(Guid id, Guid doorId, CancellationToken ct) =>
+        AccessGroupView.From(await accessGroups
+            .ModifyAsync(unitOfWork, id, Resource, g => g.RemoveDoor(doorId), ct)
+            .ConfigureAwait(false));
 
     /// <summary>Deletes the group and removes every member from it, in one atomic commit.</summary>
     public async Task DeleteAsync(Guid id, CancellationToken ct)
@@ -88,17 +95,5 @@ public sealed class AccessGroupService(
 
         accessGroups.Remove(group);
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-    }
-
-    /// <summary>Commits only when the command changed something, so no-op requests leave no change-trail entry.</summary>
-    private async Task<AccessGroupView> SaveIfChangedAsync(AccessGroup group, bool changed, CancellationToken ct)
-    {
-        if (changed)
-        {
-            accessGroups.Update(group);
-            await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        }
-
-        return AccessGroupView.From(group);
     }
 }

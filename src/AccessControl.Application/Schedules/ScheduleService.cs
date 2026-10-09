@@ -1,6 +1,5 @@
 using AccessControl.Application.Abstractions;
 using AccessControl.Application.Errors;
-using AccessControl.Domain.Common;
 using AccessControl.Domain.Schedules;
 
 namespace AccessControl.Application.Schedules;
@@ -26,7 +25,7 @@ public sealed class ScheduleService(
     IAccessGroupRepository accessGroups,
     IUnitOfWork unitOfWork)
 {
-    private const string Resource = "Schedule";
+    private const string Resource = ResourceNames.Schedule;
     private const int MaxWindows = 200;
 
     public async Task<ScheduleView> CreateAsync(ScheduleRequest request, CancellationToken ct)
@@ -41,11 +40,13 @@ public sealed class ScheduleService(
     public async Task<ScheduleView> GetAsync(Guid id, CancellationToken ct) =>
         ScheduleView.From(await schedules.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
 
-    public async Task<IReadOnlyList<ScheduleView>> ListAsync(CancellationToken ct) =>
-        (await schedules.ListAsync(ct).ConfigureAwait(false))
-            .OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(ScheduleView.From)
-            .ToList();
+    public async Task<PagedResult<ScheduleView>> ListAsync(PageRequest page, CancellationToken ct) =>
+        PagedResult.Create(
+            (await schedules.ListAsync(ct).ConfigureAwait(false))
+                .OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(s => s.Id)
+                .Select(ScheduleView.From),
+            page);
 
     /// <summary>Replaces the schedule's name, time zone and windows. Takes effect on the next badge read.</summary>
     public async Task<ScheduleView> UpdateAsync(Guid id, ScheduleRequest request, CancellationToken ct)
@@ -76,17 +77,17 @@ public sealed class ScheduleService(
     {
         if (windows is null)
         {
-            throw DomainException.Validation("windows.required", "windows is required (may be empty).");
+            throw new RequestValidationException("windows.required", "windows is required (may be empty).");
         }
 
         if (windows.Count > MaxWindows)
         {
-            throw DomainException.Validation("windows.too_many", $"A schedule may have at most {MaxWindows} windows.");
+            throw new RequestValidationException("windows.too_many", $"A schedule may have at most {MaxWindows} windows.");
         }
 
         return windows
             .Select(w => w is null
-                ? throw DomainException.Validation("windows.invalid", "windows must not contain null entries.")
+                ? throw new RequestValidationException("windows.invalid", "windows must not contain null entries.")
                 : WeeklyTimeWindow.Create(
                     w.Day,
                     WeeklyTimeWindow.ParseTime(w.Start, "start"),

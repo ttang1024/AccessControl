@@ -18,8 +18,6 @@ public sealed class AuditTrailTests : IDisposable
 
     private string AccessLog => Path.Combine(_host.DataDirectory, "access-events.jsonl");
 
-    private string ChangeLog => Path.Combine(_host.DataDirectory, "changes.jsonl");
-
     [Fact]
     public async Task Commits_record_actor_kind_and_before_after_state()
     {
@@ -40,6 +38,18 @@ public sealed class AuditTrailTests : IDisposable
         Assert.Equal("Lockdown", lockdown.After!.Value.GetProperty("mode").GetString());
         Assert.Null(changes.Items[0].After);
         Assert.Null(changes.Items[2].Before);
+    }
+
+    [Fact]
+    public async Task Commands_that_change_nothing_leave_no_change_trail_entry()
+    {
+        var door = await CreateDoorAsync("A");
+        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, default));
+        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, default)); // already locked down
+        await _host.Scope<DoorService, DoorView>(s => s.UpdateAsync(door.Id, new DoorRequest(" A ", null), default)); // same once trimmed
+
+        var changes = await QueryChangesAsync(new ChangeAuditFilter(EntityId: door.Id));
+        Assert.Equal([ChangeKind.Updated, ChangeKind.Created], changes.Items.Select(c => c.Kind));
     }
 
     [Fact]
@@ -196,6 +206,110 @@ public sealed class AuditTrailTests : IDisposable
     }
 
     [Fact]
+    public async Task Queries_page_newest_first_across_segments_even_when_the_clock_moved_back()
+    {
+        using var host = new TestHost(settings: new Dictionary<string, string?> { ["Storage:AuditSegmentMaxBytes"] = "1" });
+        var door = await host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("A", null), default));
+        var start = host.Clock.Now;
+        var ids = new List<Guid>();
+        foreach (var at in new[] { start, start.AddMinutes(1), start.AddMinutes(1), start.AddMinutes(-5) })
+        {
+            host.Clock.Now = at;
+            ids.Add((await host.Scope<AccessService, AccessResponse>(s =>
+                s.RequestAccessAsync(new AccessRequest(door.Id, "ABCD"), default))).EventId);
+        }
+
+        var page = await host.Scope<AccessService, PagedResult<AccessEventView>>(s =>
+            s.QueryEventsAsync(new AccessEventFilter(), PageRequest.From(1, 2), default));
+
+        // Newest first: ids[2] and ids[1] share a timestamp, so the later-appended one comes first.
+        Assert.Equal(4, page.Total);
+        Assert.Equal([ids[1], ids[0]], page.Items.Select(e => e.Id));
+    }
+
+    [Fact]
+    public async Task Time_filtered_queries_stay_correct_once_segment_ranges_are_known()
+    {
+        using var host = new TestHost(settings: new Dictionary<string, string?> { ["Storage:AuditSegmentMaxBytes"] = "1" });
+        var door = await host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("A", null), default));
+        var day1 = host.Clock.Now;
+        for (var day = 0; day < 3; day++)
+        {
+            host.Clock.Now = day1.AddDays(day);
+            await host.Scope<AccessService, AccessResponse>(s => s.RequestAccessAsync(new AccessRequest(door.Id, "ABCD"), default));
+        }
+
+        Task<PagedResult<AccessEventView>> QueryAsync(AccessEventFilter filter) =>
+            host.Scope<AccessService, PagedResult<AccessEventView>>(s => s.QueryEventsAsync(filter, PageRequest.From(null, null), default));
+
+        // Repeated so the second round runs against the remembered ranges of the archived segments.
+        for (var round = 0; round < 2; round++)
+        {
+            var recent = await QueryAsync(new AccessEventFilter(From: day1.AddDays(1)));
+            Assert.Equal([day1.AddDays(2), day1.AddDays(1)], recent.Items.Select(e => e.OccurredAt));
+
+            var oldest = await QueryAsync(new AccessEventFilter(To: day1.AddDays(1)));
+            Assert.Equal([day1], oldest.Items.Select(e => e.OccurredAt));
+
+            Assert.Equal(3, (await QueryAsync(new AccessEventFilter())).Total);
+            Assert.Equal(0, (await QueryAsync(new AccessEventFilter(From: day1.AddDays(3)))).Total);
+        }
+    }
+
+    [Fact]
+    public async Task Without_from_audit_queries_cover_the_default_window_before_to_or_now()
+    {
+        using var host = new TestHost(settings: new Dictionary<string, string?> { ["AuditQuery:DefaultDays"] = "7" });
+        var start = host.Clock.Now;
+        foreach (var daysAgo in new[] { 20, 10, 3 })
+        {
+            host.Clock.Now = start.AddDays(-daysAgo);
+            await host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest($"{daysAgo} days ago", null), default));
+        }
+
+        host.Clock.Now = start;
+        Task<PagedResult<ChangeAuditEntry>> ChangesAsync(DateTimeOffset? from, DateTimeOffset? to) =>
+            host.Scope<AuditService, PagedResult<ChangeAuditEntry>>(s =>
+                s.QueryChangesAsync(new ChangeAuditFilter(From: from, To: to), PageRequest.From(null, null), default));
+
+        Assert.Equal([start.AddDays(-3)], (await ChangesAsync(null, null)).Items.Select(c => c.OccurredAt));
+        Assert.Equal([start.AddDays(-10)], (await ChangesAsync(null, start.AddDays(-5))).Items.Select(c => c.OccurredAt));
+        Assert.Equal(1, (await ChangesAsync(null, start.AddYears(1))).Total); // a future "to" counts back from now
+        Assert.Equal(3, (await ChangesAsync(start.AddDays(-30), null)).Total); // an explicit "from" is honoured
+    }
+
+    [Fact]
+    public async Task Access_event_queries_default_to_the_recent_window()
+    {
+        var door = await CreateDoorAsync("A");
+        var start = _host.Clock.Now;
+        _host.Clock.Now = start.AddDays(-31);
+        await RequestAsync(door.Id);
+        _host.Clock.Now = start;
+        await RequestAsync(door.Id);
+
+        var recent = await _host.Scope<AccessService, PagedResult<AccessEventView>>(s =>
+            s.QueryEventsAsync(new AccessEventFilter(), PageRequest.From(null, null), default));
+        var all = await _host.Scope<AccessService, PagedResult<AccessEventView>>(s =>
+            s.QueryEventsAsync(new AccessEventFilter(From: start.AddDays(-60)), PageRequest.From(null, null), default));
+
+        Assert.Equal([start], recent.Items.Select(e => e.OccurredAt));
+        Assert.Equal(2, all.Total);
+    }
+
+    [Fact]
+    public async Task Audit_queries_refuse_to_page_deeper_than_the_limit()
+    {
+        var page = PageRequest.From(PageRequest.MaxAuditOffset + 1, null);
+
+        var error = await Assert.ThrowsAsync<RequestValidationException>(() =>
+            _host.Scope<AccessService, PagedResult<AccessEventView>>(s => s.QueryEventsAsync(new AccessEventFilter(), page, default)));
+        Assert.Equal("offset.too_deep", error.Code);
+        await Assert.ThrowsAsync<RequestValidationException>(() =>
+            _host.Scope<AuditService, PagedResult<ChangeAuditEntry>>(s => s.QueryChangesAsync(new ChangeAuditFilter(), page, default)));
+    }
+
+    [Fact]
     public async Task Retention_removes_old_segments_and_the_rest_still_verifies()
     {
         var settings = new Dictionary<string, string?>
@@ -223,12 +337,15 @@ public sealed class AuditTrailTests : IDisposable
     }
 
     [Fact]
-    public async Task Entries_written_before_chaining_are_still_read_and_reported_as_legacy()
+    public async Task A_log_replaced_by_unchained_entries_is_detected_after_restart()
     {
         var directory = _host.DataDirectory;
         var door = await CreateDoorAsync("A");
+        await RequestAsync(door.Id);
         _host.Stop();
-        var legacy = JsonSerializer.Serialize(new
+
+        // Someone rewrites history as plain entries, which no hash covers.
+        var forged = JsonSerializer.Serialize(new
         {
             id = Guid.NewGuid(),
             occurredAt = DateTimeOffset.UnixEpoch,
@@ -239,19 +356,111 @@ public sealed class AuditTrailTests : IDisposable
             granted = false,
             reason = "UnknownCredential",
         });
-        await File.WriteAllTextAsync(AccessLog, legacy + "\n");
+        await File.WriteAllTextAsync(AccessLog, forged + "\n");
 
         using var restarted = new TestHost(dataDirectory: directory);
-        await restarted.Scope<AccessService, AccessResponse>(s => s.RequestAccessAsync(new AccessRequest(door.Id, "ABCD"), default));
-
         var events = await restarted.Scope<AccessService, PagedResult<AccessEventView>>(s =>
-            s.QueryEventsAsync(new AccessEventFilter(), PageRequest.From(null, null), default));
-        Assert.Equal(2, events.Total);
+            s.QueryEventsAsync(new AccessEventFilter(From: DateTimeOffset.UnixEpoch), PageRequest.From(null, null), default));
+        Assert.Equal(0, events.Total); // never served as if it were audit data
+
         var report = (await restarted.Scope<AuditService, IReadOnlyList<AuditChainReport>>(s => s.VerifyAsync(default)))
             .Single(r => r.Log == "access-events");
+        Assert.False(report.IsIntact);
+        Assert.Contains("unchained entry", report.Problem, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Removing_the_oldest_segment_is_detected_without_a_retention_anchor()
+    {
+        using var host = new TestHost(settings: new Dictionary<string, string?> { ["Storage:AuditSegmentMaxBytes"] = "1" });
+        var door = await host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("A", null), default));
+        for (var i = 0; i < 3; i++)
+        {
+            await host.Scope<AccessService, AccessResponse>(s => s.RequestAccessAsync(new AccessRequest(door.Id, "ABCD"), default));
+        }
+
+        host.Stop();
+        File.Delete(Directory.GetFiles(host.DataDirectory, "access-events.*.jsonl").Order(StringComparer.Ordinal).First());
+
+        using var restarted = new TestHost(dataDirectory: host.DataDirectory);
+        var report = (await restarted.Scope<AuditService, IReadOnlyList<AuditChainReport>>(s => s.VerifyAsync(default)))
+            .Single(r => r.Log == "access-events");
+        Assert.False(report.IsIntact);
+        Assert.Contains("oldest entries were removed", report.Problem, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_forged_retention_anchor_is_detected()
+    {
+        var settings = new Dictionary<string, string?>
+        {
+            ["Storage:AuditSegmentMaxBytes"] = "1",
+            ["Storage:AuditRetentionDays"] = "30",
+            ["Storage:AuditHmacKey"] = "secret-from-a-vault-0123456789abcdef",
+        };
+        using var host = new TestHost(settings: settings);
+        var door = await host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("A", null), default));
+        for (var i = 0; i < 4; i++)
+        {
+            await host.Scope<AccessService, AccessResponse>(s => s.RequestAccessAsync(new AccessRequest(door.Id, "ABCD"), default));
+        }
+
+        var oldest = Directory.GetFiles(host.DataDirectory, "access-events.*.jsonl").Order(StringComparer.Ordinal).First();
+        File.SetLastWriteTimeUtc(oldest, host.Clock.GetUtcNow().UtcDateTime.AddDays(-31));
+        host.Stop();
+        var retention = new TestHost(now: host.Clock.Now, dataDirectory: host.DataDirectory, settings: settings);
+        retention.GetRequiredService<IAccessEventLog>(); // opening the log applies retention, which writes the anchor
+        retention.Stop();
+
+        // Someone deletes one more segment and moves the anchor forward without the key.
+        var anchorPath = Path.Combine(host.DataDirectory, "access-events.anchor.json");
+        var next = Directory.GetFiles(host.DataDirectory, "access-events.*.jsonl").Order(StringComparer.Ordinal).First();
+        var lastLine = JsonDocument.Parse((await File.ReadAllLinesAsync(next)).Last()).RootElement;
+        File.Delete(next);
+        var anchor = JsonDocument.Parse(await File.ReadAllTextAsync(anchorPath)).RootElement;
+        await File.WriteAllTextAsync(anchorPath, JsonSerializer.Serialize(new
+        {
+            sequence = lastLine.GetProperty("seq").GetInt64(),
+            hash = lastLine.GetProperty("hash").GetString(),
+            signature = anchor.GetProperty("signature").GetString(),
+        }));
+
+        using var restarted = new TestHost(now: host.Clock.Now, dataDirectory: host.DataDirectory, settings: settings);
+        var report = (await restarted.Scope<AuditService, IReadOnlyList<AuditChainReport>>(s => s.VerifyAsync(default)))
+            .Single(r => r.Log == "access-events");
+        Assert.False(report.IsIntact);
+        Assert.Contains("anchor does not match its signature", report.Problem, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Reports_carry_the_chain_head_for_off_host_monitoring()
+    {
+        var door = await CreateDoorAsync("A");
+        await RequestAsync(door.Id);
+        await RequestAsync(door.Id);
+
+        var report = (await VerifyAsync()).Single(r => r.Log == "access-events");
+        var lastLine = JsonDocument.Parse((await File.ReadAllLinesAsync(AccessLog)).Last()).RootElement;
+
+        Assert.Equal(2, report.LastSequence);
+        Assert.Equal(lastLine.GetProperty("hash").GetString(), report.LastHash);
+    }
+
+    [Fact]
+    public async Task Concurrent_badge_reads_share_writes_and_keep_one_unbroken_chain()
+    {
+        var door = await CreateDoorAsync("A");
+
+        var reads = Enumerable.Range(0, 50).Select(_ => Task.Run(() => RequestAsync(door.Id)));
+        var responses = await Task.WhenAll(reads);
+
+        var report = (await VerifyAsync()).Single(r => r.Log == "access-events");
         Assert.True(report.IsIntact, report.Problem);
-        Assert.Equal(1, report.LegacyEntries);
-        Assert.Equal(1, report.Entries);
+        Assert.Equal(50, report.Entries);
+        var lines = await File.ReadAllLinesAsync(AccessLog);
+        Assert.Equal(
+            responses.Select(r => r.EventId).Order(),
+            lines.Select(l => JsonDocument.Parse(l).RootElement.GetProperty("data").GetProperty("id").GetGuid()).Order());
     }
 
     [Fact]

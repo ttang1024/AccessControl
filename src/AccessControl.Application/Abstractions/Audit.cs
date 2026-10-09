@@ -70,19 +70,23 @@ public interface IChangeAuditLog
 /// <param name="Log">Which log (e.g. <c>access-events</c>, <c>changes</c>).</param>
 /// <param name="IsIntact">False if any entry was altered, removed, reordered or inserted.</param>
 /// <param name="Entries">Chained entries checked.</param>
-/// <param name="LegacyEntries">Entries written before hash chaining existed; they cannot be checked.</param>
 /// <param name="SkippedLines">Unreadable lines (e.g. torn by a crash). The chain is still checked across them.</param>
 /// <param name="FirstSequence">Sequence number of the oldest chained entry still on disk.</param>
 /// <param name="LastSequence">Sequence number of the newest chained entry.</param>
+/// <param name="LastHash">
+/// Hash of the newest entry. The chain cannot prove that its newest entries were not removed while the service was
+/// stopped, so monitoring should store (<paramref name="LastSequence"/>, <paramref name="LastHash"/>) off this host
+/// and alert if a later report has a lower sequence or a different hash for the same sequence.
+/// </param>
 /// <param name="Problem">Where and why verification failed, when <paramref name="IsIntact"/> is false.</param>
 public sealed record AuditChainReport(
     string Log,
     bool IsIntact,
     long Entries,
-    long LegacyEntries,
     long SkippedLines,
     long? FirstSequence,
     long? LastSequence,
+    string? LastHash,
     string? Problem);
 
 public interface IAuditIntegrity

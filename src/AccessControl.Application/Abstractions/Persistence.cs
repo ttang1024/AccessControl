@@ -26,6 +26,7 @@ public interface IRepository<TAggregate>
     /// <summary>
     /// Stages changes to an aggregate loaded in this unit of work. Committing fails with a
     /// concurrency conflict if someone else committed a change to it after it was loaded.
+    /// If the aggregate is unchanged, nothing is written and no change-trail entry is recorded.
     /// </summary>
     void Update(TAggregate aggregate);
 

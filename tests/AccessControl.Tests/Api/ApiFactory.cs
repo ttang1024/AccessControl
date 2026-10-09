@@ -75,6 +75,8 @@ internal sealed class ApiFactory(Dictionary<string, string?>? overrides = null, 
         settings["Storage:DataDirectory"] = DataDirectory;
         settings["Storage:FlushAuditToDisk"] = "false";
         settings["Storage:MinimumFreeDiskBytes"] = "1";
+        settings["Storage:AuditHmacKey"] = "test-audit-hmac-key-0123456789abcdef";
+        settings["AllowedHosts"] = "localhost";
         foreach (var (key, value) in overrides ?? [])
         {
             settings[key] = value;

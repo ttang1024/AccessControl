@@ -18,7 +18,7 @@ public sealed partial class DoorService(
     IUnitOfWork unitOfWork,
     ILogger<DoorService> logger)
 {
-    private const string Resource = "Door";
+    private const string Resource = ResourceNames.Door;
 
     public async Task<DoorView> CreateAsync(DoorRequest request, CancellationToken ct)
     {
@@ -32,11 +32,13 @@ public sealed partial class DoorService(
     public async Task<DoorView> GetAsync(Guid id, CancellationToken ct) =>
         DoorView.From(await doors.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
 
-    public async Task<IReadOnlyList<DoorView>> ListAsync(CancellationToken ct) =>
-        (await doors.ListAsync(ct).ConfigureAwait(false))
-            .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
-            .Select(DoorView.From)
-            .ToList();
+    public async Task<PagedResult<DoorView>> ListAsync(PageRequest page, CancellationToken ct) =>
+        PagedResult.Create(
+            (await doors.ListAsync(ct).ConfigureAwait(false))
+                .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(d => d.Id)
+                .Select(DoorView.From),
+            page);
 
     public Task<DoorView> UpdateAsync(Guid id, DoorRequest request, CancellationToken ct)
     {
@@ -72,14 +74,8 @@ public sealed partial class DoorService(
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
     }
 
-    private async Task<DoorView> ModifyAsync(Guid id, Action<Door> change, CancellationToken ct)
-    {
-        var door = await doors.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        change(door);
-        doors.Update(door);
-        await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return DoorView.From(door);
-    }
+    private async Task<DoorView> ModifyAsync(Guid id, Action<Door> change, CancellationToken ct) =>
+        DoorView.From(await doors.ModifyAsync(unitOfWork, id, Resource, change, ct).ConfigureAwait(false));
 
     private static partial class Log
     {

@@ -1,6 +1,7 @@
 using AccessControl.Application.Abstractions;
 using AccessControl.Domain.AccessGroups;
 using AccessControl.Domain.Cardholders;
+using AccessControl.Domain.Common;
 using AccessControl.Domain.Credentials;
 using AccessControl.Domain.Doors;
 using AccessControl.Domain.Schedules;
@@ -33,7 +34,7 @@ internal abstract class DocumentRepository<TAggregate, TRecord>(
     protected DocumentSession Session { get; } = session;
 
     public Task<TAggregate?> GetAsync(Guid id, CancellationToken cancellationToken) =>
-        Task.FromResult(Session.Load<TRecord>(collection, id) is { } record ? ToAggregate(record) : null);
+        Task.FromResult(Session.Load<TRecord>(collection, id) is { } record ? Rehydrate(record) : null);
 
     public Task<IReadOnlyList<TAggregate>> GetManyAsync(IEnumerable<Guid> ids, CancellationToken cancellationToken)
     {
@@ -41,7 +42,7 @@ internal abstract class DocumentRepository<TAggregate, TRecord>(
             .Distinct()
             .Select(id => Session.Load<TRecord>(collection, id))
             .OfType<TRecord>()
-            .Select(ToAggregate)
+            .Select(Rehydrate)
             .ToList();
         return Task.FromResult(result);
     }
@@ -56,11 +57,28 @@ internal abstract class DocumentRepository<TAggregate, TRecord>(
 
     protected Task<IReadOnlyList<TAggregate>> WhereAsync(Func<TRecord, bool> predicate)
     {
-        IReadOnlyList<TAggregate> result = Session.Query<TRecord>(collection).Where(predicate).Select(ToAggregate).ToList();
+        IReadOnlyList<TAggregate> result = Session.Query<TRecord>(collection).Where(predicate).Select(Rehydrate).ToList();
         return Task.FromResult(result);
     }
 
-    protected IEnumerable<TAggregate> All() => Session.Query<TRecord>(collection).Select(ToAggregate);
+    protected IEnumerable<TAggregate> All() => Session.Query<TRecord>(collection).Select(Rehydrate);
+
+    /// <summary>
+    /// Maps a stored record to its aggregate. An aggregate that rejects its stored state means the data (or the host,
+    /// e.g. a missing time-zone database) is broken: that is a server fault, not a client's invalid request, so it is
+    /// raised as <see cref="InvalidDataException"/> (500) instead of the domain's validation error (400).
+    /// </summary>
+    protected TAggregate Rehydrate(TRecord record)
+    {
+        try
+        {
+            return ToAggregate(record);
+        }
+        catch (DomainException ex)
+        {
+            throw new InvalidDataException($"Stored {collection} document is invalid ({ex.Code}): {ex.Message}", ex);
+        }
+    }
 
     protected abstract TRecord ToRecord(TAggregate aggregate);
 
@@ -103,7 +121,7 @@ internal sealed class CredentialRepository(DocumentSession session)
         Task.FromResult(
             Session.LoadByKey<CredentialRecord>(Collections.Credentials, Collections.CardNumberIndex, cardNumber.Value)
                 is { } record
-                ? ToAggregate(record)
+                ? Rehydrate(record)
                 : null);
 
     public Task<IReadOnlyList<Credential>> ListByCardholderAsync(Guid cardholderId, CancellationToken cancellationToken) =>

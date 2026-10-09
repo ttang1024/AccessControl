@@ -15,7 +15,7 @@ namespace AccessControl.Infrastructure.Storage;
 /// </summary>
 internal sealed class DocumentSession(DocumentStore store, IActorContext actor) : IUnitOfWork
 {
-    private readonly Dictionary<(string Collection, Guid Id), int> _loadedVersions = [];
+    private readonly Dictionary<(string Collection, Guid Id), StoredDocument> _loaded = [];
     private readonly Dictionary<(string Collection, Guid Id), PendingChange> _pending = [];
     private StoreSnapshot? _view;
 
@@ -33,15 +33,8 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
     }
 
     public TRecord? LoadByKey<TRecord>(string collection, string indexName, string key)
-        where TRecord : class
-    {
-        if (store.CollectionOf(indexName) != collection)
-        {
-            throw new InvalidOperationException($"Index '{indexName}' is not over collection '{collection}'.");
-        }
-
-        return View.FindId(indexName, key) is { } id ? Load<TRecord>(collection, id) : null;
-    }
+        where TRecord : class =>
+        View.FindId(indexName, key) is { } id ? Load<TRecord>(collection, id) : null;
 
     /// <summary>Every document in the collection, including this session's staged changes.</summary>
     public IEnumerable<TRecord> Query<TRecord>(string collection)
@@ -69,22 +62,35 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
     public void Insert<TRecord>(string collection, Guid id, TRecord record) =>
         Stage(collection, id, ExpectedVersionForInsert(collection, id), Serialize(record));
 
-    public void Replace<TRecord>(string collection, Guid id, TRecord record) =>
-        Stage(collection, id, ExpectedVersionForExisting(collection, id), Serialize(record));
+    /// <summary>
+    /// Stages an update, unless the record serialises exactly as it was loaded: a command that changed nothing then
+    /// writes nothing and leaves no change-trail entry.
+    /// </summary>
+    public void Replace<TRecord>(string collection, Guid id, TRecord record)
+    {
+        var expectedVersion = ExpectedVersionForExisting(collection, id);
+        var body = Serialize(record);
+        if (!_pending.ContainsKey((collection, id))
+            && _loaded.TryGetValue((collection, id), out var loaded)
+            && loaded.Body.GetRawText() == body.GetRawText())
+        {
+            return;
+        }
+
+        Stage(collection, id, expectedVersion, body);
+    }
 
     public void Delete(string collection, Guid id) =>
         Stage(collection, id, ExpectedVersionForExisting(collection, id), body: null);
 
-    public Task CommitAsync(CancellationToken cancellationToken)
+    public async Task CommitAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        store.Commit(_pending.Values.ToList(), actor.Actor);
+        await store.CommitAsync(_pending.Values.ToList(), actor.Actor, cancellationToken).ConfigureAwait(false);
 
         // Versions moved on; anything still held by the caller must be reloaded before another write.
         _pending.Clear();
-        _loadedVersions.Clear();
+        _loaded.Clear();
         _view = null;
-        return Task.CompletedTask;
     }
 
     private TRecord? Track<TRecord>(string collection, StoredDocument? doc)
@@ -95,7 +101,7 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
             return null;
         }
 
-        _loadedVersions.TryAdd((collection, doc.Id), doc.Version);
+        _loaded.TryAdd((collection, doc.Id), doc);
         return Deserialize<TRecord>(doc.Body);
     }
 
@@ -109,8 +115,8 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
             return staged.ExpectedVersion;
         }
 
-        return _loadedVersions.TryGetValue((collection, id), out var version)
-            ? version
+        return _loaded.TryGetValue((collection, id), out var loaded)
+            ? loaded.Version
             : throw new InvalidOperationException(
                 $"Document {collection}/{id} must be loaded in this unit of work before it is updated or removed.");
     }

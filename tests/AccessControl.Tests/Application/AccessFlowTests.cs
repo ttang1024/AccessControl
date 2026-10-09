@@ -1,5 +1,6 @@
 using AccessControl.Application.Abstractions;
 using AccessControl.Application.Access;
+using AccessControl.Application.Audit;
 using AccessControl.Application.AccessGroups;
 using AccessControl.Application.Cardholders;
 using AccessControl.Application.Credentials;
@@ -54,7 +55,7 @@ public sealed class AccessFlowTests : IDisposable
         var events = await _f.Host.Scope<AccessService, PagedResult<AccessEventView>>(s =>
             s.QueryEventsAsync(new AccessEventFilter(Granted: false), PageRequest.From(null, null), default));
         Assert.Equal(2, events.Total);
-        Assert.Equal("invalid:not-a-card", events.Items[0].CardNumber);
+        Assert.Equal("invalid:****card", events.Items[0].CardNumber);
     }
 
     [Fact]
@@ -90,6 +91,73 @@ public sealed class AccessFlowTests : IDisposable
                 s.IssueAsync(other.Id, new IssueCredentialRequest(site.CardNumber.ToLowerInvariant(), null), default)));
         Assert.Equal("credential.duplicate_card_number", ex.Code);
     }
+
+    [Fact]
+    public async Task Decisions_are_counted_by_outcome_and_reason()
+    {
+        var site = await _f.SeedSiteAsync();
+        var seen = new System.Collections.Concurrent.ConcurrentBag<(string? Outcome, string? Reason)>();
+        using var listener = new System.Diagnostics.Metrics.MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            if (instrument.Meter.Name == AccessService.MeterName && instrument.Name == "accesscontrol.access.decisions")
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var values = tags.ToArray().ToDictionary(t => t.Key, t => t.Value as string);
+            seen.Add((values.GetValueOrDefault("outcome"), values.GetValueOrDefault("reason")));
+        });
+        listener.Start();
+
+        await _f.RequestAsync(site.DoorId, site.CardNumber);
+        await _f.RequestAsync(site.DoorId, "FFFF");
+
+        // Other tests run in parallel and use the same meter, so look for ours rather than counting.
+        Assert.Contains(("granted", "Granted"), seen);
+        Assert.Contains(("denied", "UnknownCredential"), seen);
+    }
+
+    [Fact]
+    public async Task Lists_are_paged_by_name()
+    {
+        foreach (var name in new[] { "Cellar", "attic", "Basement" })
+        {
+            await _f.Host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest(name, null), default));
+        }
+
+        var page = await _f.Host.Scope<DoorService, PagedResult<DoorView>>(s => s.ListAsync(PageRequest.From(1, 1), default));
+
+        Assert.Equal(3, page.Total);
+        Assert.Equal(["Basement"], page.Items.Select(d => d.Name));
+    }
+
+    [Fact]
+    public async Task Responses_never_contain_a_full_card_number()
+    {
+        var site = await _f.SeedSiteAsync();
+        await _f.RequestAsync(site.DoorId, site.CardNumber);
+
+        var credential = await _f.Host.Scope<CredentialService, CredentialView>(s => s.GetAsync(site.CredentialId, default));
+        var events = await _f.Host.Scope<AccessService, PagedResult<AccessEventView>>(s =>
+            s.QueryEventsAsync(new AccessEventFilter(), PageRequest.From(null, null), default));
+        var issued = await _f.Host.Scope<AuditService, PagedResult<ChangeAuditEntry>>(s =>
+            s.QueryChangesAsync(new ChangeAuditFilter(EntityId: site.CredentialId), PageRequest.From(null, null), default));
+
+        Assert.Equal("****1234", credential.CardNumber);
+        Assert.Equal("****1234", events.Items.Single().CardNumber);
+        Assert.Equal("****1234", issued.Items.Single().After!.Value.GetProperty("cardNumber").GetString());
+    }
+
+    [Theory]
+    [InlineData("ABCD1234", "****1234")]
+    [InlineData("ABCD", "****CD")]
+    [InlineData("A", "****")]
+    [InlineData("invalid:", "invalid:****")]
+    public void Masking_shows_at_most_four_and_never_more_than_half(string value, string expected) =>
+        Assert.Equal(expected, CardNumberMask.Mask(value));
 
     [Fact]
     public async Task Deleting_an_access_group_removes_membership_atomically()
@@ -137,6 +205,8 @@ internal sealed class TestHostFixture(DateTimeOffset now) : IDisposable
     public Task<AccessResponse> RequestAsync(Guid doorId, string cardNumber) =>
         Host.Scope<AccessService, AccessResponse>(s => s.RequestAccessAsync(new AccessRequest(doorId, cardNumber), default));
 
+    public const string IssuedCardNumber = "AB:CD:12:34";
+
     public async Task<SeededSite> SeedSiteAsync(string workdayStart = "00:00", string workdayEnd = "24:00")
     {
         var schedule = await Host.Scope<ScheduleService, ScheduleView>(s => s.CreateAsync(
@@ -156,9 +226,10 @@ internal sealed class TestHostFixture(DateTimeOffset now) : IDisposable
             s.CreateAsync(new CardholderRequest("Ada", "Lovelace", "E-1", null, null), default));
         await Host.Scope<CardholderService, CardholderView>(s => s.JoinAccessGroupAsync(cardholder.Id, group.Id, default));
         var credential = await Host.Scope<CredentialService, CredentialView>(s =>
-            s.IssueAsync(cardholder.Id, new IssueCredentialRequest("AB:CD:12:34", null), default));
+            s.IssueAsync(cardholder.Id, new IssueCredentialRequest(IssuedCardNumber, null), default));
 
-        return new SeededSite(door.Id, schedule.Id, group.Id, cardholder.Id, credential.Id, credential.CardNumber);
+        // The API only returns masked card numbers, so badge reads use the number that was issued.
+        return new SeededSite(door.Id, schedule.Id, group.Id, cardholder.Id, credential.Id, IssuedCardNumber);
     }
 }
 

@@ -4,7 +4,9 @@ obj/
 .vs/
 .idea/
 TestResults/
+.DS_Store
 CLAUDE.md
+tech_doc
 # Runtime data written by the API (store.json, access-events.jsonl)
 data/
 data-dev/

@@ -8,7 +8,7 @@ namespace AccessControl.Infrastructure.Persistence;
 
 /// <summary>
 /// Configuration-change trail in <c>changes*.jsonl</c> (hash-chained, rotated). Written by
-/// <see cref="DocumentStore.Commit"/> inside the commit lock, before the change is persisted or visible.
+/// <see cref="DocumentStore.CommitAsync"/> inside the commit gate, before the change is persisted or visible.
 /// </summary>
 internal sealed class JsonLinesChangeLog(
     IOptions<StorageOptions> options,
@@ -16,25 +16,25 @@ internal sealed class JsonLinesChangeLog(
     ILogger<JsonLinesChangeLog> logger)
     : IChangeAuditLog, IDisposable
 {
-    private readonly ChainedJsonLinesLog _log = new("changes", options.Value, clock, logger);
+    internal ChainedJsonLinesLog Log { get; } = new("changes", options.Value, clock, logger);
 
-    internal ChainedJsonLinesLog Log => _log;
-
-    public void Append(IReadOnlyList<ChangeRecord> records) =>
-        _log.Append(records.Select(r => JsonSerializer.SerializeToUtf8Bytes(r, StorageJson.Options)).ToList());
+    public Task AppendAsync(IReadOnlyList<ChangeRecord> records) =>
+        Log.AppendAsync(records.Select(r => JsonSerializer.SerializeToUtf8Bytes(r, StorageJson.Options)).ToList());
 
     public Task<PagedResult<ChangeAuditEntry>> QueryAsync(
         ChangeAuditFilter filter, PageRequest page, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(filter);
-        return _log.QueryAsync<ChangeRecord, ChangeAuditEntry>(
+        return Log.QueryAsync<ChangeRecord, ChangeAuditEntry>(
             r => new ChangeAuditEntry(
                 r.Id, r.OccurredAt, r.Actor, r.CommitId, r.Collection, r.EntityId, r.Kind, r.Version, r.Before, r.After),
             filter.Matches,
             e => e.OccurredAt,
+            filter.From,
+            filter.To,
             page,
             cancellationToken);
     }
 
-    public void Dispose() => _log.Dispose();
+    public void Dispose() => Log.Dispose();
 }

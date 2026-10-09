@@ -22,14 +22,17 @@ public sealed class RateLimitingOptions
     public int UserPermitsPerMinute { get; set; } = 600;
 
     /// <summary>
-    /// Requests per minute per client IP for unauthenticated traffic, including wrong keys and <c>/health</c>.
-    /// Slows API key guessing.
+    /// Requests per minute per client IP for unauthenticated traffic, including wrong keys. Slows API key guessing.
+    /// <c>/health</c> has a separate budget of the same size, so that bad-key traffic from the same address (e.g. a
+    /// load balancer or proxy) cannot make liveness probes fail and get a healthy instance restarted.
     /// </summary>
     public int AnonymousPermitsPerMinute { get; set; } = 60;
 }
 
 internal static class RateLimitingSetup
 {
+    public const string HealthPath = "/health";
+
     public static IServiceCollection AddAccessControlRateLimiting(this IServiceCollection services, IConfiguration configuration)
     {
         services.AddOptions<RateLimitingOptions>()
@@ -52,10 +55,13 @@ internal static class RateLimitingSetup
 
                 // Runs after authentication, so a valid key gets its own budget and everything else is per IP.
                 var user = context.User;
-                var (key, permits) = user.Identity?.IsAuthenticated == true
-                    ? ("key:" + user.FindFirstValue(ClaimTypes.Name),
-                        user.IsInRole(Roles.DoorController) ? settings.DoorControllerPermitsPerMinute : settings.UserPermitsPerMinute)
-                    : ("ip:" + (context.Connection.RemoteIpAddress?.ToString() ?? "unknown"), settings.AnonymousPermitsPerMinute);
+                var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+                var (key, permits) = context.Request.Path.StartsWithSegments(HealthPath)
+                    ? ("health:" + ip, settings.AnonymousPermitsPerMinute)
+                    : user.Identity?.IsAuthenticated == true
+                        ? ("key:" + user.FindFirstValue(ClaimTypes.Name),
+                            user.IsInRole(Roles.DoorController) ? settings.DoorControllerPermitsPerMinute : settings.UserPermitsPerMinute)
+                        : ("ip:" + ip, settings.AnonymousPermitsPerMinute);
 
                 return RateLimitPartition.GetFixedWindowLimiter(key, _ => new FixedWindowRateLimiterOptions
                 {

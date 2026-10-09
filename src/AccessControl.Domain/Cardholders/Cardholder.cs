@@ -95,12 +95,10 @@ public sealed class Cardholder
 
     public void Disable() => IsEnabled = false;
 
-    /// <returns><c>false</c> if the cardholder was already a member.</returns>
-    public bool JoinAccessGroup(Guid accessGroupId) =>
+    public void JoinAccessGroup(Guid accessGroupId) =>
         _accessGroupIds.Add(Guard.NotEmpty(accessGroupId, "accessGroupId"));
 
-    /// <returns><c>false</c> if the cardholder was not a member.</returns>
-    public bool LeaveAccessGroup(Guid accessGroupId) => _accessGroupIds.Remove(accessGroupId);
+    public void LeaveAccessGroup(Guid accessGroupId) => _accessGroupIds.Remove(accessGroupId);
 
     public bool IsWithinValidityPeriod(DateTimeOffset instant) =>
         (ValidFrom is null || instant >= ValidFrom) && (ValidUntil is null || instant < ValidUntil);

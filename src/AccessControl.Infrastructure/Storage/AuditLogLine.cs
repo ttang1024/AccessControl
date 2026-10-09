@@ -7,8 +7,8 @@ internal enum AuditLineKind
     /// <summary><c>{seq, prev, hash, data}</c>.</summary>
     Chained,
 
-    /// <summary>Written before hash chaining existed: the whole line is the payload.</summary>
-    Legacy,
+    /// <summary>Well-formed JSON but not a chain entry. This service never writes one, so it was put there by hand.</summary>
+    Unchained,
 
     /// <summary>Unreadable, e.g. torn by a crash.</summary>
     Corrupt,
@@ -49,7 +49,7 @@ internal sealed record AuditLogLine(
                     data.Clone(), includeRaw ? data.GetRawText() : null);
             }
 
-            return new AuditLogLine(AuditLineKind.Legacy, location, 0, null, null, root.Clone(), null);
+            return new AuditLogLine(AuditLineKind.Unchained, location, 0, null, null, default, null);
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {

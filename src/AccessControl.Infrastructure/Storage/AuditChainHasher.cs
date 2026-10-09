@@ -13,6 +13,9 @@ internal sealed class AuditChainHasher(string? hmacKey)
     /// <summary>The <c>prev</c> of the first entry in a chain.</summary>
     public const string EmptyHash = "";
 
+    // Entry payloads are JSON objects, so this tag can never be mistaken for one.
+    private static readonly byte[] AnchorTag = "anchor"u8.ToArray();
+
     private readonly byte[]? _key = string.IsNullOrEmpty(hmacKey) ? null : Encoding.UTF8.GetBytes(hmacKey);
 
     public string Compute(long sequence, string previous, ReadOnlySpan<byte> payload)
@@ -27,7 +30,14 @@ internal sealed class AuditChainHasher(string? hmacKey)
 
     /// <summary>Constant-time check that <paramref name="hash"/> is the link for the given entry.</summary>
     public bool IsValid(long sequence, string previous, string rawData, string hash) =>
-        CryptographicOperations.FixedTimeEquals(
-            Encoding.ASCII.GetBytes(Compute(sequence, previous, Encoding.UTF8.GetBytes(rawData))),
-            Encoding.ASCII.GetBytes(hash));
+        SameHash(Compute(sequence, previous, Encoding.UTF8.GetBytes(rawData)), hash);
+
+    /// <summary>Signs an <see cref="AuditChainAnchor"/>: the last entry retention removed.</summary>
+    public string SignAnchor(long sequence, string hash) => Compute(sequence, hash, AnchorTag);
+
+    public bool IsValid(AuditChainAnchor anchor) =>
+        SameHash(SignAnchor(anchor.Sequence, anchor.Hash), anchor.Signature);
+
+    private static bool SameHash(string expected, string actual) =>
+        CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(expected), Encoding.ASCII.GetBytes(actual));
 }

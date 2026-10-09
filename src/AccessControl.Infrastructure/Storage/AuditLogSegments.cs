@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 
@@ -22,9 +23,11 @@ internal sealed partial class AuditLogSegments
     private readonly long _segmentMaxBytes;
     private readonly int? _retentionDays;
     private readonly TimeProvider _clock;
+    private readonly AuditChainHasher _hasher;
+    private readonly string _anchorPath;
     private readonly ILogger _logger;
 
-    public AuditLogSegments(string name, StorageOptions options, TimeProvider clock, ILogger logger)
+    public AuditLogSegments(string name, StorageOptions options, TimeProvider clock, AuditChainHasher hasher, ILogger logger)
     {
         _name = name;
         _directory = Path.GetFullPath(options.DataDirectory);
@@ -34,6 +37,8 @@ internal sealed partial class AuditLogSegments
         _segmentMaxBytes = options.AuditSegmentMaxBytes > 0 ? options.AuditSegmentMaxBytes : long.MaxValue;
         _retentionDays = options.AuditRetentionDays;
         _clock = clock;
+        _hasher = hasher;
+        _anchorPath = Path.Combine(_directory, name + ".anchor.json");
         _logger = logger;
     }
 
@@ -56,6 +61,11 @@ internal sealed partial class AuditLogSegments
         ApplyRetention();
     }
 
+    /// <summary>
+    /// Deletes expired archived segments, oldest first, stopping at the first one still within the retention period
+    /// so that what remains is always an unbroken chain. Before deleting, records the newest entry being removed as the
+    /// signed <see cref="AuditChainAnchor"/> that verification continues from.
+    /// </summary>
     public void ApplyRetention()
     {
         if (_retentionDays is not { } days)
@@ -64,14 +74,54 @@ internal sealed partial class AuditLogSegments
         }
 
         var cutoff = _clock.GetUtcNow().UtcDateTime.AddDays(-days);
-        foreach (var path in Archived())
+        var expired = Archived().TakeWhile(path => File.GetLastWriteTimeUtc(path) < cutoff).ToList();
+        if (expired.Count == 0)
         {
-            if (File.GetLastWriteTimeUtc(path) < cutoff)
-            {
-                File.Delete(path);
-                Log.SegmentExpired(_logger, _name, Path.GetFileName(path), days);
-            }
+            return;
         }
+
+        // Written first: after a crash in between, the anchor names an entry that is still on disk, which verifies.
+        if (LastEntryIn(expired[^1]) is { } last)
+        {
+            WriteAnchor(new AuditChainAnchor(last.Sequence, last.Hash, _hasher.SignAnchor(last.Sequence, last.Hash)));
+        }
+
+        foreach (var path in expired)
+        {
+            File.Delete(path);
+            Log.SegmentExpired(_logger, _name, Path.GetFileName(path), days);
+        }
+    }
+
+    /// <summary>The anchor left by retention, or <c>null</c> if retention has never removed anything.</summary>
+    public AuditChainAnchor? ReadAnchor()
+    {
+        if (!File.Exists(_anchorPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<AuditChainAnchor>(File.ReadAllBytes(_anchorPath), StorageJson.Options);
+        }
+        catch (JsonException)
+        {
+            // Reported by verification as an invalid anchor rather than crashing the caller.
+            return new AuditChainAnchor(0, string.Empty, string.Empty);
+        }
+    }
+
+    private void WriteAnchor(AuditChainAnchor anchor)
+    {
+        var temp = _anchorPath + ".tmp";
+        using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            JsonSerializer.Serialize(stream, anchor, StorageJson.Options);
+            stream.Flush(flushToDisk: true);
+        }
+
+        File.Move(temp, _anchorPath, overwrite: true);
     }
 
     /// <summary>If the process died mid-append, end the torn line so the next append starts cleanly.</summary>
@@ -97,44 +147,52 @@ internal sealed partial class AuditLogSegments
         }
     }
 
-    /// <summary>The newest complete chained entry: in the active file, else in the newest archived segment.</summary>
+    /// <summary>
+    /// The newest complete chained entry: in the active file, else in the newest archived segment, else the
+    /// retention anchor (everything was deleted), else the start of a new chain.
+    /// </summary>
     public (long Sequence, string Hash) FindChainHead()
     {
         var newestFirst = Archived();
         newestFirst.Reverse();
         foreach (var path in newestFirst.Prepend(ActivePath))
         {
-            if (!File.Exists(path))
-            {
-                continue;
-            }
-
-            (long, string)? head = null;
-            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            using (var reader = new StreamReader(stream, Encoding.UTF8))
-            {
-                while (reader.ReadLine() is { } text)
-                {
-                    if (!text.StartsWith("{\"seq\":", StringComparison.Ordinal))
-                    {
-                        continue;
-                    }
-
-                    var line = AuditLogLine.Parse(path, 0, text, includeRaw: false);
-                    if (line.Kind == AuditLineKind.Chained)
-                    {
-                        head = (line.Sequence, line.Hash!);
-                    }
-                }
-            }
-
-            if (head is { } found)
+            if (LastEntryIn(path) is { } found)
             {
                 return found;
             }
         }
 
-        return (0, AuditChainHasher.EmptyHash);
+        return ReadAnchor() is { } anchor && _hasher.IsValid(anchor)
+            ? (anchor.Sequence, anchor.Hash)
+            : (0, AuditChainHasher.EmptyHash);
+    }
+
+    private static (long Sequence, string Hash)? LastEntryIn(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        (long, string)? last = null;
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        while (reader.ReadLine() is { } text)
+        {
+            if (!text.StartsWith("{\"seq\":", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var line = AuditLogLine.Parse(path, 0, text, includeRaw: false);
+            if (line.Kind == AuditLineKind.Chained)
+            {
+                last = (line.Sequence, line.Hash!);
+            }
+        }
+
+        return last;
     }
 
     /// <summary>

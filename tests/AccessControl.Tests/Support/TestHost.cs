@@ -35,7 +35,7 @@ internal sealed class TestHost : IDisposable
         services.AddLogging();
         services.AddSingleton<TimeProvider>(Clock);
         services.AddSingleton<IActorContext>(Actor);
-        services.AddAccessControlApplication();
+        services.AddAccessControlApplication(configuration);
         services.AddAccessControlInfrastructure(configuration);
         _provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
     }

@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -57,7 +56,6 @@ public sealed partial class ApiKeyAuthenticationHandler(
         {
             new(ClaimTypes.Name, match.Name),
             new(ClaimTypes.Role, match.Role),
-            new("auth_time", TimeProvider.GetUtcNow().ToString("O", CultureInfo.InvariantCulture)),
         };
         if (match.Role == Roles.DoorController)
         {

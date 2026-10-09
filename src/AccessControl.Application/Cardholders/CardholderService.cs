@@ -1,4 +1,5 @@
 using AccessControl.Application.Abstractions;
+using AccessControl.Application.Errors;
 using AccessControl.Domain.Cardholders;
 
 namespace AccessControl.Application.Cardholders;
@@ -30,7 +31,7 @@ public sealed class CardholderService(
     IAccessGroupRepository accessGroups,
     IUnitOfWork unitOfWork)
 {
-    private const string Resource = "Cardholder";
+    private const string Resource = ResourceNames.Cardholder;
 
     public async Task<CardholderView> CreateAsync(CardholderRequest request, CancellationToken ct)
     {
@@ -66,32 +67,16 @@ public sealed class CardholderService(
     public async Task<CardholderView> JoinAccessGroupAsync(Guid id, Guid accessGroupId, CancellationToken ct)
     {
         var cardholder = await cardholders.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        await accessGroups.GetRequiredAsync(accessGroupId, "AccessGroup", ct).ConfigureAwait(false);
-        return await SaveIfChangedAsync(cardholder, cardholder.JoinAccessGroup(accessGroupId), ct).ConfigureAwait(false);
-    }
-
-    public async Task<CardholderView> LeaveAccessGroupAsync(Guid id, Guid accessGroupId, CancellationToken ct)
-    {
-        var cardholder = await cardholders.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        return await SaveIfChangedAsync(cardholder, cardholder.LeaveAccessGroup(accessGroupId), ct).ConfigureAwait(false);
-    }
-
-    private async Task<CardholderView> ModifyAsync(Guid id, Action<Cardholder> change, CancellationToken ct)
-    {
-        var cardholder = await cardholders.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        change(cardholder);
-        return await SaveIfChangedAsync(cardholder, changed: true, ct).ConfigureAwait(false);
-    }
-
-    /// <summary>Commits only when the command changed something, so no-op requests leave no change-trail entry.</summary>
-    private async Task<CardholderView> SaveIfChangedAsync(Cardholder cardholder, bool changed, CancellationToken ct)
-    {
-        if (changed)
-        {
-            cardholders.Update(cardholder);
-            await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        }
-
+        await accessGroups.GetRequiredAsync(accessGroupId, ResourceNames.AccessGroup, ct).ConfigureAwait(false);
+        cardholder.JoinAccessGroup(accessGroupId);
+        cardholders.Update(cardholder);
+        await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
         return CardholderView.From(cardholder);
     }
+
+    public Task<CardholderView> LeaveAccessGroupAsync(Guid id, Guid accessGroupId, CancellationToken ct) =>
+        ModifyAsync(id, c => c.LeaveAccessGroup(accessGroupId), ct);
+
+    private async Task<CardholderView> ModifyAsync(Guid id, Action<Cardholder> change, CancellationToken ct) =>
+        CardholderView.From(await cardholders.ModifyAsync(unitOfWork, id, Resource, change, ct).ConfigureAwait(false));
 }

@@ -1,4 +1,5 @@
 using AccessControl.Api.Auth;
+using AccessControl.Application.Abstractions;
 using AccessControl.Application.Schedules;
 
 namespace AccessControl.Api.Endpoints;
@@ -11,7 +12,8 @@ internal static class ScheduleEndpoints
         var read = g.WithPolicy(Policies.Read);
         var configure = g.WithPolicy(Policies.Configure);
 
-        read.MapGet("/", (ScheduleService s, CancellationToken ct) => s.ListAsync(ct));
+        read.MapGet("/", (int? offset, int? limit, ScheduleService s, CancellationToken ct) =>
+            s.ListAsync(PageRequest.From(offset, limit), ct));
         configure.MapPost("/", (ScheduleRequest body, ScheduleService s, CancellationToken ct) =>
             s.CreateAsync(body, ct).CreatedAt("/api/v1/schedules", x => x.Id));
         read.MapGet("/{id:guid}", (Guid id, ScheduleService s, CancellationToken ct) => s.GetAsync(id, ct));

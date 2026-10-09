@@ -4,8 +4,12 @@
     <RootNamespace>AccessControl.Application</RootNamespace>
   </PropertyGroup>
 
+  <!-- Only the abstractions this layer needs, never the ASP.NET Core framework: keeps HTTP types out of Application. -->
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
   </ItemGroup>
 
   <ItemGroup>

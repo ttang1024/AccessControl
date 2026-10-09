@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - run: dotnet restore
+      # Warnings are errors in src/ (src/Directory.Build.props).
+      - run: dotnet build --no-restore -c Release
+      - run: dotnet test --no-build -c Release
+      - run: docker build -t access-control .

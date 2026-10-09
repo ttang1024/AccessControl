@@ -17,9 +17,7 @@ internal sealed class JsonLinesAccessEventLog(
     ILogger<JsonLinesAccessEventLog> logger)
     : IAccessEventLog, IDisposable
 {
-    private readonly ChainedJsonLinesLog _log = new("access-events", options.Value, clock, logger);
-
-    internal ChainedJsonLinesLog Log => _log;
+    internal ChainedJsonLinesLog Log { get; } = new("access-events", options.Value, clock, logger);
 
     public Task AppendAsync(AccessEvent accessEvent, CancellationToken cancellationToken)
     {
@@ -27,21 +25,23 @@ internal sealed class JsonLinesAccessEventLog(
         var record = new AccessEventRecord(
             accessEvent.Id, accessEvent.OccurredAt, accessEvent.DoorId, accessEvent.CardNumber,
             accessEvent.CredentialId, accessEvent.CardholderId, accessEvent.Granted, accessEvent.Reason);
-        return _log.AppendAsync(JsonSerializer.SerializeToUtf8Bytes(record, StorageJson.Options), cancellationToken);
+        return Log.AppendAsync(JsonSerializer.SerializeToUtf8Bytes(record, StorageJson.Options), cancellationToken);
     }
 
     public Task<PagedResult<AccessEvent>> QueryAsync(
         AccessEventFilter filter, PageRequest page, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(filter);
-        return _log.QueryAsync<AccessEventRecord, AccessEvent>(
+        return Log.QueryAsync<AccessEventRecord, AccessEvent>(
             r => new AccessEvent(
                 r.Id, r.OccurredAt, r.DoorId, r.CardNumber, r.CredentialId, r.CardholderId, r.Granted, r.Reason),
             filter.Matches,
             e => e.OccurredAt,
+            filter.From,
+            filter.To,
             page,
             cancellationToken);
     }
 
-    public void Dispose() => _log.Dispose();
+    public void Dispose() => Log.Dispose();
 }

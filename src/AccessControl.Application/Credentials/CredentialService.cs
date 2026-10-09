@@ -17,7 +17,7 @@ public sealed record CredentialView(
     DateTimeOffset? ExpiresAt)
 {
     public static CredentialView From(Credential c) =>
-        new(c.Id, c.CardholderId, c.CardNumber.Value, c.Status, c.IssuedAt, c.ExpiresAt);
+        new(c.Id, c.CardholderId, CardNumberMask.Mask(c.CardNumber.Value), c.Status, c.IssuedAt, c.ExpiresAt);
 }
 
 public sealed class CredentialService(
@@ -26,7 +26,7 @@ public sealed class CredentialService(
     IUnitOfWork unitOfWork,
     TimeProvider clock)
 {
-    private const string Resource = "Credential";
+    private const string Resource = ResourceNames.Credential;
 
     /// <summary>
     /// Issues a card to a cardholder. Card numbers are unique for life: the check here gives a clear
@@ -36,7 +36,7 @@ public sealed class CredentialService(
     {
         ArgumentNullException.ThrowIfNull(request);
         var cardNumber = CardNumber.Parse(request.CardNumber);
-        await cardholders.GetRequiredAsync(cardholderId, "Cardholder", ct).ConfigureAwait(false);
+        await cardholders.GetRequiredAsync(cardholderId, ResourceNames.Cardholder, ct).ConfigureAwait(false);
 
         if (await credentials.FindByCardNumberAsync(cardNumber, ct).ConfigureAwait(false) is not null)
         {
@@ -56,7 +56,7 @@ public sealed class CredentialService(
 
     public async Task<IReadOnlyList<CredentialView>> ListForCardholderAsync(Guid cardholderId, CancellationToken ct)
     {
-        await cardholders.GetRequiredAsync(cardholderId, "Cardholder", ct).ConfigureAwait(false);
+        await cardholders.GetRequiredAsync(cardholderId, ResourceNames.Cardholder, ct).ConfigureAwait(false);
         var list = await credentials.ListByCardholderAsync(cardholderId, ct).ConfigureAwait(false);
         return list.OrderBy(c => c.IssuedAt).Select(CredentialView.From).ToList();
     }
@@ -75,12 +75,6 @@ public sealed class CredentialService(
         return ModifyAsync(id, c => c.ChangeExpiry(request.ExpiresAt), ct);
     }
 
-    private async Task<CredentialView> ModifyAsync(Guid id, Action<Credential> change, CancellationToken ct)
-    {
-        var credential = await credentials.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        change(credential);
-        credentials.Update(credential);
-        await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return CredentialView.From(credential);
-    }
+    private async Task<CredentialView> ModifyAsync(Guid id, Action<Credential> change, CancellationToken ct) =>
+        CredentialView.From(await credentials.ModifyAsync(unitOfWork, id, Resource, change, ct).ConfigureAwait(false));
 }

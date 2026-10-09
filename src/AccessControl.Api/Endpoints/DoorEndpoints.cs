@@ -1,4 +1,5 @@
 using AccessControl.Api.Auth;
+using AccessControl.Application.Abstractions;
 using AccessControl.Application.Doors;
 
 namespace AccessControl.Api.Endpoints;
@@ -12,7 +13,8 @@ internal static class DoorEndpoints
         var configure = g.WithPolicy(Policies.Configure);
         var lockdown = g.WithPolicy(Policies.Lockdown);
 
-        read.MapGet("/", (DoorService s, CancellationToken ct) => s.ListAsync(ct));
+        read.MapGet("/", (int? offset, int? limit, DoorService s, CancellationToken ct) =>
+            s.ListAsync(PageRequest.From(offset, limit), ct));
         configure.MapPost("/", (DoorRequest body, DoorService s, CancellationToken ct) =>
             s.CreateAsync(body, ct).CreatedAt("/api/v1/doors", d => d.Id));
         read.MapGet("/{id:guid}", (Guid id, DoorService s, CancellationToken ct) => s.GetAsync(id, ct));

@@ -1,4 +1,8 @@
+using System.Diagnostics.Metrics;
 using AccessControl.Application.Abstractions;
+using AccessControl.Application.Audit;
+using AccessControl.Application.Credentials;
+using AccessControl.Application.Errors;
 using AccessControl.Domain.Access;
 using AccessControl.Domain.Credentials;
 using Microsoft.Extensions.Logging;
@@ -21,7 +25,7 @@ public sealed record AccessEventView(
     AccessDecisionReason Reason)
 {
     public static AccessEventView From(AccessEvent e) =>
-        new(e.Id, e.OccurredAt, e.DoorId, e.CardNumber, e.CredentialId, e.CardholderId, e.Granted, e.Reason);
+        new(e.Id, e.OccurredAt, e.DoorId, CardNumberMask.Mask(e.CardNumber), e.CredentialId, e.CardholderId, e.Granted, e.Reason);
 }
 
 public sealed partial class AccessService(
@@ -31,11 +35,23 @@ public sealed partial class AccessService(
     IAccessGroupRepository accessGroups,
     IScheduleRepository schedules,
     IAccessEventLog eventLog,
+    AuditQueryWindow window,
     TimeProvider clock,
     ILogger<AccessService> logger)
 {
+    /// <summary>Meter name for <c>dotnet-counters</c> or an OpenTelemetry exporter.</summary>
+    public const string MeterName = "AccessControl.Access";
+
     /// <summary>Raw, unparseable card data is truncated to this length before it is audited.</summary>
     private const int MaxRawCardLength = 64;
+
+    private static readonly Meter Meter = new(MeterName);
+
+    private static readonly Counter<long> Decisions = Meter.CreateCounter<long>(
+        "accesscontrol.access.decisions", description: "Audited badge-read decisions, by outcome and reason.");
+
+    private static readonly Histogram<double> Duration = Meter.CreateHistogram<double>(
+        "accesscontrol.access.duration", unit: "ms", description: "Time to evaluate and audit a badge read.");
 
     /// <summary>
     /// Evaluates a badge read and records the outcome. Every evaluated request is audited,
@@ -45,8 +61,9 @@ public sealed partial class AccessService(
     public async Task<AccessResponse> RequestAccessAsync(AccessRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
+        var started = clock.GetTimestamp();
         var now = clock.GetUtcNow();
-        var door = await doors.GetRequiredAsync(request.DoorId, "Door", ct).ConfigureAwait(false);
+        var door = await doors.GetRequiredAsync(request.DoorId, ResourceNames.Door, ct).ConfigureAwait(false);
 
         var parsed = CardNumber.TryParse(request.CardNumber, out var cardNumber);
         var credential = parsed
@@ -90,13 +107,21 @@ public sealed partial class AccessService(
         // Card numbers are not logged: for most card technologies the number is all an attacker needs to
         // clone a card, and application logs travel further than the audit log. The event id links to it.
         Log.AccessDecided(logger, decision.IsGranted ? "granted" : "denied", door.Id, decision.Reason, accessEvent.Id);
+        Decisions.Add(
+            1,
+            new KeyValuePair<string, object?>("outcome", decision.IsGranted ? "granted" : "denied"),
+            new KeyValuePair<string, object?>("reason", decision.Reason.ToString()));
+        Duration.Record(clock.GetElapsedTime(started).TotalMilliseconds);
 
         return new AccessResponse(accessEvent.Id, decision.IsGranted, decision.Reason, now);
     }
 
     public async Task<PagedResult<AccessEventView>> QueryEventsAsync(
         AccessEventFilter filter, PageRequest page, CancellationToken ct) =>
-        (await eventLog.QueryAsync(filter, page, ct).ConfigureAwait(false)).Map(AccessEventView.From);
+        (await eventLog
+            .QueryAsync(filter with { From = window.StartOf(filter.From, filter.To) }, page.EnsureAuditDepth(), ct)
+            .ConfigureAwait(false))
+        .Map(AccessEventView.From);
 
     private static string Sanitize(string? raw)
     {

@@ -37,11 +37,9 @@ public sealed class AccessGroup
 
     public void ChangeSchedule(Guid scheduleId) => ScheduleId = Guard.NotEmpty(scheduleId, "scheduleId");
 
-    /// <returns><c>false</c> if the door was already in the group.</returns>
-    public bool AddDoor(Guid doorId) => _doorIds.Add(Guard.NotEmpty(doorId, "doorId"));
+    public void AddDoor(Guid doorId) => _doorIds.Add(Guard.NotEmpty(doorId, "doorId"));
 
-    /// <returns><c>false</c> if the door was not in the group.</returns>
-    public bool RemoveDoor(Guid doorId) => _doorIds.Remove(doorId);
+    public void RemoveDoor(Guid doorId) => _doorIds.Remove(doorId);
 
     public bool Covers(Guid doorId) => _doorIds.Contains(doorId);
 }

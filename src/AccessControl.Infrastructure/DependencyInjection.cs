@@ -1,11 +1,8 @@
-using System.Text.Json;
 using AccessControl.Application.Abstractions;
-using AccessControl.Application.Errors;
 using AccessControl.Infrastructure.Persistence;
 using AccessControl.Infrastructure.Storage;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 namespace AccessControl.Infrastructure;
 
@@ -20,13 +17,11 @@ public static class DependencyInjection
             .Validate(o => o.AuditRetentionDays is null or > 0, "Storage:AuditRetentionDays must be positive when set.")
             .ValidateOnStart();
 
-        services.AddSingleton(new UniqueIndex(
-            Collections.Credentials,
-            Collections.CardNumberIndex,
-            body => body.TryGetProperty("cardNumber", out var value) && value.ValueKind == JsonValueKind.String
-                ? value.GetString()
-                : null,
-            ConflictException.DuplicateCardNumber));
+        services.AddSingleton(StoreConstraints.CardNumber);
+        foreach (var foreignKey in StoreConstraints.ForeignKeys)
+        {
+            services.AddSingleton(foreignKey);
+        }
 
         services.AddSingleton<JsonLinesChangeLog>();
         services.AddSingleton<IChangeAuditLog>(sp => sp.GetRequiredService<JsonLinesChangeLog>());

@@ -17,6 +17,7 @@ internal sealed class ProblemDetailsExceptionHandler(IProblemDetailsService prob
         {
             DomainException { Kind: DomainErrorKind.Validation } e => (StatusCodes.Status400BadRequest, "Invalid request", e.Code),
             DomainException e => (StatusCodes.Status409Conflict, "Operation not allowed in current state", e.Code),
+            RequestValidationException e => (StatusCodes.Status400BadRequest, "Invalid request", e.Code),
             NotFoundException e => (StatusCodes.Status404NotFound, "Not found", e.Code),
             ConflictException e => (StatusCodes.Status409Conflict, "Conflict", e.Code),
             BadHttpRequestException e => (e.StatusCode, "Bad request", "request.malformed"),
