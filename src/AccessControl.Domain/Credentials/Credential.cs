@@ -11,7 +11,7 @@ public enum CredentialStatus
 }
 
 /// <summary>
-/// A physical card bound to one cardholder.
+/// A physical card bound to one cardholder, identified by its <see cref="CardFingerprint"/> (never the number itself).
 /// <para>
 /// Lifecycle: <c>Active ⇄ Suspended</c>; <c>Active|Suspended → Lost</c>; any non-revoked → <c>Revoked</c>.
 /// Lost and Revoked are terminal. Card numbers are unique for life, so a lost card that turns up
@@ -23,14 +23,16 @@ public sealed class Credential
     private Credential(
         Guid id,
         Guid cardholderId,
-        CardNumber cardNumber,
+        CardFingerprint card,
         CredentialStatus status,
         DateTimeOffset issuedAt,
         DateTimeOffset? expiresAt)
     {
         Id = Guard.NotEmpty(id, "credential.id");
         CardholderId = Guard.NotEmpty(cardholderId, "cardholderId");
-        CardNumber = cardNumber;
+        Card = card.Digest is null
+            ? throw DomainException.Validation("card.required", "A card is required.")
+            : card;
         Status = status;
         IssuedAt = issuedAt;
         ExpiresAt = expiresAt;
@@ -40,7 +42,7 @@ public sealed class Credential
 
     public Guid CardholderId { get; }
 
-    public CardNumber CardNumber { get; }
+    public CardFingerprint Card { get; }
 
     public CredentialStatus Status { get; private set; }
 
@@ -52,26 +54,21 @@ public sealed class Credential
     public bool IsTerminal => Status is CredentialStatus.Lost or CredentialStatus.Revoked;
 
     public static Credential Issue(
-        Guid id, Guid cardholderId, CardNumber cardNumber, DateTimeOffset issuedAt, DateTimeOffset? expiresAt)
+        Guid id, Guid cardholderId, CardFingerprint card, DateTimeOffset issuedAt, DateTimeOffset? expiresAt)
     {
-        if (cardNumber.Value is null)
-        {
-            throw DomainException.Validation("cardNumber.required", "Card number is required.");
-        }
-
         EnsureValidExpiry(expiresAt, issuedAt);
-        return new Credential(id, cardholderId, cardNumber, CredentialStatus.Active, issuedAt, expiresAt);
+        return new Credential(id, cardholderId, card, CredentialStatus.Active, issuedAt, expiresAt);
     }
 
     /// <summary>Rebuilds a credential from persisted state. Not for issuing new credentials.</summary>
     public static Credential Rehydrate(
         Guid id,
         Guid cardholderId,
-        CardNumber cardNumber,
+        CardFingerprint card,
         CredentialStatus status,
         DateTimeOffset issuedAt,
         DateTimeOffset? expiresAt) =>
-        new(id, cardholderId, cardNumber, status, issuedAt, expiresAt);
+        new(id, cardholderId, card, status, issuedAt, expiresAt);
 
     public void Suspend() => Transition(CredentialStatus.Suspended, CredentialStatus.Active);
 

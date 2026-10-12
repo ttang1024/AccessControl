@@ -99,6 +99,11 @@ public sealed class ApiSecurityTests : IAsyncLifetime, IDisposable
     [InlineData(ApiFactory.AdminKey, "POST", "/api/v1/doors", HttpStatusCode.Created)]
     [InlineData(ApiFactory.AdminKey, "POST", "/api/v1/doors/11111111-1111-1111-1111-111111111111/release", HttpStatusCode.OK)]
     [InlineData(ApiFactory.AdminKey, "GET", "/api/v1/audit/verify", HttpStatusCode.OK)]
+    [InlineData(ApiFactory.OperatorKey, "POST", "/api/v1/doors/lockdown", HttpStatusCode.OK)]
+    [InlineData(ApiFactory.AuditorKey, "POST", "/api/v1/doors/lockdown", HttpStatusCode.Forbidden)]
+    [InlineData(ApiFactory.OperatorKey, "POST", "/api/v1/doors/release", HttpStatusCode.Forbidden)]
+    [InlineData(ApiFactory.AdminKey, "POST", "/api/v1/doors/release", HttpStatusCode.OK)]
+    [InlineData(ApiFactory.ControllerKey, "POST", "/api/v1/doors/lockdown", HttpStatusCode.Forbidden)]
     public async Task Roles_only_reach_their_endpoints(string key, string method, string path, HttpStatusCode expected)
     {
         using var request = new HttpRequestMessage(new HttpMethod(method), path);
@@ -236,6 +241,8 @@ public sealed class ApiStartupValidationTests
 
 public sealed class ApiSwaggerTests
 {
+    private static readonly JsonSerializerOptions Indented = new() { WriteIndented = true };
+
     [Fact]
     public async Task Development_serves_swagger_ui_and_document_without_a_key()
     {
@@ -249,6 +256,41 @@ public sealed class ApiSwaggerTests
         var document = await client.GetFromJsonAsync<JsonElement>("/swagger/v1/swagger.json");
         Assert.True(document.GetProperty("paths").TryGetProperty("/api/v1/access/requests", out _));
         Assert.True(document.GetProperty("components").GetProperty("securitySchemes").TryGetProperty("ApiKey", out _));
+    }
+
+    /// <summary>
+    /// <c>docs/openapi.json</c> is the published contract (for client generation and review in pull requests). It must
+    /// match what the API serves; after an intended change, regenerate it with <c>UPDATE_OPENAPI=1 dotnet test</c>.
+    /// </summary>
+    [Fact]
+    public async Task The_published_openapi_document_matches_the_api()
+    {
+        using var api = new ApiFactory(new() { ["Auth:ApiKeys:1:Role"] = "DoorController" }, environment: "Development");
+        var served = await api.Client(apiKey: null).GetStringAsync("/swagger/v1/swagger.json");
+        var normalised = JsonSerializer.Serialize(JsonDocument.Parse(served).RootElement, Indented) + "\n";
+
+        var path = Path.Combine(RepositoryRoot(), "docs", "openapi.json");
+        if (Environment.GetEnvironmentVariable("UPDATE_OPENAPI") == "1")
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllTextAsync(path, normalised);
+        }
+
+        Assert.True(File.Exists(path), "docs/openapi.json is missing; run UPDATE_OPENAPI=1 dotnet test.");
+        Assert.True(
+            (await File.ReadAllTextAsync(path)).ReplaceLineEndings("\n") == normalised.ReplaceLineEndings("\n"),
+            "docs/openapi.json is out of date; run UPDATE_OPENAPI=1 dotnet test and commit it.");
+    }
+
+    private static string RepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "AccessControl.sln")))
+        {
+            directory = directory.Parent;
+        }
+
+        return directory?.FullName ?? throw new InvalidOperationException("AccessControl.sln not found above the test binaries.");
     }
 
     [Theory]

@@ -71,7 +71,7 @@ public sealed class DocumentStoreTests : IDisposable
     {
         var directory = _host.DataDirectory;
         var door = await _host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("Persisted", "Roof"), default));
-        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, default));
+        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, null, default));
         _host.Stop();
 
         using var restarted = new TestHost(dataDirectory: directory);
@@ -80,7 +80,7 @@ public sealed class DocumentStoreTests : IDisposable
         Assert.Equal(DoorMode.Lockdown, reloaded.Mode);
 
         // Versions are restored too: an update after restart commits cleanly.
-        var released = await restarted.Scope<DoorService, DoorView>(s => s.ReleaseLockdownAsync(door.Id, default));
+        var released = await restarted.Scope<DoorService, DoorView>(s => s.ReleaseLockdownAsync(door.Id, null, default));
         Assert.Equal(DoorMode.Secure, released.Mode);
     }
 
@@ -95,13 +95,13 @@ public sealed class DocumentStoreTests : IDisposable
         creating.ServiceProvider.GetRequiredService<IAccessGroupRepository>().Add(AccessGroup.Create(Guid.NewGuid(), "Staff", schedule.Id));
 
         // ...when the schedule is deleted.
-        await _host.Scope<ScheduleService>(s => s.DeleteAsync(schedule.Id, default));
+        await _host.Scope<ScheduleService>(s => s.DeleteAsync(schedule.Id, null, default));
 
         var ex = await Assert.ThrowsAsync<NotFoundException>(() =>
             creating.ServiceProvider.GetRequiredService<IUnitOfWork>().CommitAsync(default));
         Assert.Equal("schedule.not_found", ex.Code);
         Assert.Empty((await _host.Scope<AccessGroupService, PagedResult<AccessGroupView>>(s =>
-            s.ListAsync(PageRequest.From(null, null), default))).Items);
+            s.SearchAsync(null, PageRequest.From(null, null), default))).Items);
     }
 
     [Fact]
@@ -109,10 +109,9 @@ public sealed class DocumentStoreTests : IDisposable
     {
         var schedule = await CreateScheduleAsync();
 
-        // The delete has found no groups using the schedule but not committed yet...
+        // The delete has loaded the schedule (no group uses it yet) but not committed...
         using var deleting = _host.CreateScope();
         var schedules = deleting.ServiceProvider.GetRequiredService<IScheduleRepository>();
-        Assert.Empty(await deleting.ServiceProvider.GetRequiredService<IAccessGroupRepository>().ListByScheduleAsync(schedule.Id, default));
         schedules.Remove((await schedules.GetAsync(schedule.Id, default))!);
 
         // ...when a group starts using it.
@@ -137,7 +136,7 @@ public sealed class DocumentStoreTests : IDisposable
         loaded.AddDoor(door.Id);
         groups.Update(loaded);
 
-        await _host.Scope<DoorService>(s => s.DeleteAsync(door.Id, default));
+        await _host.Scope<DoorService>(s => s.DeleteAsync(door.Id, null, default));
 
         var ex = await Assert.ThrowsAsync<NotFoundException>(() =>
             adding.ServiceProvider.GetRequiredService<IUnitOfWork>().CommitAsync(default));
@@ -157,7 +156,7 @@ public sealed class DocumentStoreTests : IDisposable
         Assert.Empty(await deleting.ServiceProvider.GetRequiredService<ICardholderRepository>().ListByAccessGroupAsync(group.Id, default));
         groups.Remove((await groups.GetAsync(group.Id, default))!);
 
-        await _host.Scope<CardholderService, CardholderView>(s => s.JoinAccessGroupAsync(person.Id, group.Id, default));
+        await _host.Scope<CardholderService, CardholderView>(s => s.JoinAccessGroupAsync(person.Id, group.Id, null, default));
 
         var ex = await Assert.ThrowsAsync<ConflictException>(() =>
             deleting.ServiceProvider.GetRequiredService<IUnitOfWork>().CommitAsync(default));

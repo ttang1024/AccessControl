@@ -7,19 +7,28 @@ using Microsoft.Extensions.Options;
 namespace AccessControl.Infrastructure.Persistence;
 
 /// <summary>
-/// Configuration-change trail in <c>changes*.jsonl</c> (hash-chained, rotated). Written by
-/// <see cref="DocumentStore.CommitAsync"/> inside the commit gate, before the change is persisted or visible.
+/// Configuration-change trail in <c>changes*.jsonl</c> (hash-chained, rotated), and the store's write-ahead log:
+/// <see cref="DocumentStore.CommitAsync"/> commits by appending here, and startup replays it after the checkpoint.
 /// </summary>
 internal sealed class JsonLinesChangeLog(
     IOptions<StorageOptions> options,
+    DataDirectoryLock directory,
     TimeProvider clock,
     ILogger<JsonLinesChangeLog> logger)
     : IChangeAuditLog, IDisposable
 {
-    internal ChainedJsonLinesLog Log { get; } = new("changes", options.Value, clock, logger);
+    internal ChainedJsonLinesLog Log { get; } = new("changes", directory, options.Value, clock, logger);
 
-    public Task AppendAsync(IReadOnlyList<ChangeRecord> records) =>
+    /// <summary>Appends one commit's entries contiguously; returns the last one's sequence number once on disk.</summary>
+    public Task<long> AppendAsync(IReadOnlyList<ChangeRecord> records) =>
         Log.AppendAsync(records.Select(r => JsonSerializer.SerializeToUtf8Bytes(r, StorageJson.Options)).ToList());
+
+    /// <summary>The verified entries after <paramref name="sequence"/>, oldest first (see <see cref="ChainedJsonLinesLog.ReadAfter"/>).</summary>
+    public IEnumerable<(long Sequence, ChangeRecord Record)> ReadAfter(long sequence, string hash) =>
+        Log.ReadAfter(sequence, hash).Select(e => (
+            e.Sequence,
+            e.Data.Deserialize<ChangeRecord>(StorageJson.Options)
+                ?? throw new InvalidDataException($"Change log entry {e.Sequence} is empty.")));
 
     public Task<PagedResult<ChangeAuditEntry>> QueryAsync(
         ChangeAuditFilter filter, PageRequest page, CancellationToken cancellationToken)

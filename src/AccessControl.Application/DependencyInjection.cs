@@ -14,12 +14,14 @@ namespace AccessControl.Application;
 
 public static class DependencyInjection
 {
-    /// <summary>Registers application services. Persistence ports must be registered by an infrastructure module.</summary>
+    /// <summary>
+    /// Registers application services. Persistence ports must be registered by an infrastructure module, and
+    /// <see cref="IActorContext"/> by the host.
+    /// </summary>
     public static IServiceCollection AddAccessControlApplication(
         this IServiceCollection services, IConfiguration configuration)
     {
         services.TryAddSingleton(TimeProvider.System);
-        services.TryAddSingleton<IActorContext, SystemActor>();
 
         services.AddOptions<AuditQueryOptions>()
             .Bind(configuration.GetSection(AuditQueryOptions.SectionName))

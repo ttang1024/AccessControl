@@ -24,8 +24,8 @@ public sealed class AuditTrailTests : IDisposable
         _host.Actor.Actor = "alice";
         var door = await CreateDoorAsync("Front");
         _host.Actor.Actor = "bob";
-        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, default));
-        await _host.Scope<DoorService>(s => s.DeleteAsync(door.Id, default));
+        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, null, default));
+        await _host.Scope<DoorService>(s => s.DeleteAsync(door.Id, null, default));
 
         var changes = await QueryChangesAsync(new ChangeAuditFilter(EntityId: door.Id));
 
@@ -44,9 +44,9 @@ public sealed class AuditTrailTests : IDisposable
     public async Task Commands_that_change_nothing_leave_no_change_trail_entry()
     {
         var door = await CreateDoorAsync("A");
-        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, default));
-        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, default)); // already locked down
-        await _host.Scope<DoorService, DoorView>(s => s.UpdateAsync(door.Id, new DoorRequest(" A ", null), default)); // same once trimmed
+        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, null, default));
+        await _host.Scope<DoorService, DoorView>(s => s.LockdownAsync(door.Id, null, default)); // already locked down
+        await _host.Scope<DoorService, DoorView>(s => s.UpdateAsync(door.Id, new DoorRequest(" A ", null), null, default)); // same once trimmed
 
         var changes = await QueryChangesAsync(new ChangeAuditFilter(EntityId: door.Id));
         Assert.Equal([ChangeKind.Updated, ChangeKind.Created], changes.Items.Select(c => c.Kind));
@@ -319,13 +319,15 @@ public sealed class AuditTrailTests : IDisposable
         };
         using var host = new TestHost(settings: settings);
         var door = await host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("A", null), default));
+        // The first read is 31 days old: its segment is past retention. Age is the entries' time, not the file's.
+        var now = host.Clock.Now;
         for (var i = 0; i < 3; i++)
         {
+            host.Clock.Now = i == 0 ? now.AddDays(-31) : now;
             await host.Scope<AccessService, AccessResponse>(s => s.RequestAccessAsync(new AccessRequest(door.Id, "ABCD"), default));
         }
 
-        var oldest = Directory.GetFiles(host.DataDirectory, "access-events.*.jsonl").Order(StringComparer.Ordinal).First();
-        File.SetLastWriteTimeUtc(oldest, host.Clock.GetUtcNow().UtcDateTime.AddDays(-31));
+        var oldest = Path.Combine(host.DataDirectory, "access-events.000000000001.jsonl");
         host.Stop();
 
         using var restarted = new TestHost(now: host.Clock.Now, dataDirectory: host.DataDirectory, settings: settings);
@@ -400,13 +402,14 @@ public sealed class AuditTrailTests : IDisposable
         };
         using var host = new TestHost(settings: settings);
         var door = await host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("A", null), default));
+        // The first read is 31 days old: its segment is past retention. Age is the entries' time, not the file's.
+        var now = host.Clock.Now;
         for (var i = 0; i < 4; i++)
         {
+            host.Clock.Now = i == 0 ? now.AddDays(-31) : now;
             await host.Scope<AccessService, AccessResponse>(s => s.RequestAccessAsync(new AccessRequest(door.Id, "ABCD"), default));
         }
 
-        var oldest = Directory.GetFiles(host.DataDirectory, "access-events.*.jsonl").Order(StringComparer.Ordinal).First();
-        File.SetLastWriteTimeUtc(oldest, host.Clock.GetUtcNow().UtcDateTime.AddDays(-31));
         host.Stop();
         var retention = new TestHost(now: host.Clock.Now, dataDirectory: host.DataDirectory, settings: settings);
         retention.GetRequiredService<IAccessEventLog>(); // opening the log applies retention, which writes the anchor
@@ -472,7 +475,7 @@ public sealed class AuditTrailTests : IDisposable
         var doors = reader.ServiceProvider.GetRequiredService<IDoorRepository>();
         Assert.Equal("Before", (await doors.GetAsync(door.Id, default))!.Name);
 
-        await _host.Scope<DoorService, DoorView>(s => s.UpdateAsync(door.Id, new DoorRequest("After", null), default));
+        await _host.Scope<DoorService, DoorView>(s => s.UpdateAsync(door.Id, new DoorRequest("After", null), null, default));
         var created = await CreateDoorAsync("New");
 
         // Same unit of work: still the state as of its first read.

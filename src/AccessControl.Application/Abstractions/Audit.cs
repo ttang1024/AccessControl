@@ -4,17 +4,15 @@ namespace AccessControl.Application.Abstractions;
 
 /// <summary>
 /// Who is performing the current command. Recorded with every committed configuration change.
-/// The host supplies it (the API uses the authenticated key's name); the default is <see cref="SystemActor"/>.
+/// The host must register it (the API uses the authenticated key's name); there is deliberately no default, so a
+/// change can never be attributed to a made-up actor.
 /// </summary>
 public interface IActorContext
 {
     string Actor { get; }
-}
 
-/// <summary>Used outside a request, e.g. maintenance code or tests that do not care who acted.</summary>
-public sealed class SystemActor : IActorContext
-{
-    public string Actor => "system";
+    /// <summary>May add members to restricted access groups (administrators only, for segregation of duties).</summary>
+    bool CanGrantRestrictedAccess { get; }
 }
 
 public enum ChangeKind

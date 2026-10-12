@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using AccessControl.Application.Abstractions;
 
@@ -10,11 +11,16 @@ namespace AccessControl.Infrastructure.Storage;
 /// <para>
 /// All reads in a unit of work come from one committed snapshot, taken at the first read, so a request
 /// never combines data from before and after a concurrent commit (e.g. a credential loaded before a
-/// revocation with a cardholder loaded after it). The snapshot is refreshed after this session commits.
+/// revocation with a cardholder loaded after it). A document read once is read the same way again (repeatable
+/// read), and after a commit the session tracks the versions it wrote, so it can keep working.
 /// </para>
 /// </summary>
 internal sealed class DocumentSession(DocumentStore store, IActorContext actor) : IUnitOfWork
 {
+    // Stored documents are immutable, so the record deserialised from one can be shared by every request that reads
+    // it until a commit replaces it. Records are immutable too (Records.cs); aggregates are built fresh from them.
+    private static readonly ConditionalWeakTable<StoredDocument, object> Materialised = [];
+
     private readonly Dictionary<(string Collection, Guid Id), StoredDocument> _loaded = [];
     private readonly Dictionary<(string Collection, Guid Id), PendingChange> _pending = [];
     private StoreSnapshot? _view;
@@ -29,7 +35,19 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
             return staged.Body is { } body ? Deserialize<TRecord>(body) : null;
         }
 
-        return Track<TRecord>(collection, View.Get(collection, id));
+        if (_loaded.TryGetValue((collection, id), out var loaded))
+        {
+            return Materialise<TRecord>(loaded);
+        }
+
+        var doc = View.Get(collection, id);
+        if (doc is null)
+        {
+            return null;
+        }
+
+        _loaded[(collection, id)] = doc;
+        return Materialise<TRecord>(doc);
     }
 
     public TRecord? LoadByKey<TRecord>(string collection, string indexName, string key)
@@ -59,6 +77,13 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
         }
     }
 
+    /// <summary>The version of a document as loaded, or as last committed, in this unit of work.</summary>
+    public int VersionOf(string collection, Guid id) =>
+        _loaded.TryGetValue((collection, id), out var doc)
+            ? doc.Version
+            : throw new InvalidOperationException(
+                $"Document {collection}/{id} has no known version in this unit of work: it was neither loaded nor committed here.");
+
     public void Insert<TRecord>(string collection, Guid id, TRecord record) =>
         Stage(collection, id, ExpectedVersionForInsert(collection, id), Serialize(record));
 
@@ -85,24 +110,23 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
 
     public async Task CommitAsync(CancellationToken cancellationToken)
     {
-        await store.CommitAsync(_pending.Values.ToList(), actor.Actor, cancellationToken).ConfigureAwait(false);
-
-        // Versions moved on; anything still held by the caller must be reloaded before another write.
+        var committed = await store.CommitAsync(_pending.Values.ToList(), actor.Actor, cancellationToken).ConfigureAwait(false);
         _pending.Clear();
-        _loaded.Clear();
-        _view = null;
-    }
 
-    private TRecord? Track<TRecord>(string collection, StoredDocument? doc)
-        where TRecord : class
-    {
-        if (doc is null)
+        // Track what this commit wrote at its new versions, so the session can report them and write again.
+        foreach (var (collection, id, doc) in committed)
         {
-            return null;
+            if (doc is null)
+            {
+                _loaded.Remove((collection, id));
+            }
+            else
+            {
+                _loaded[(collection, id)] = doc;
+            }
         }
 
-        _loaded.TryAdd((collection, doc.Id), doc);
-        return Deserialize<TRecord>(doc.Body);
+        _view = null;
     }
 
     private int ExpectedVersionForInsert(string collection, Guid id) =>
@@ -123,6 +147,10 @@ internal sealed class DocumentSession(DocumentStore store, IActorContext actor) 
 
     private void Stage(string collection, Guid id, int expectedVersion, JsonElement? body) =>
         _pending[(collection, id)] = new PendingChange(collection, id, expectedVersion, body);
+
+    private static TRecord Materialise<TRecord>(StoredDocument doc)
+        where TRecord : class =>
+        Materialised.GetValue(doc, d => Deserialize<TRecord>(d.Body)) as TRecord ?? Deserialize<TRecord>(doc.Body);
 
     private static JsonElement Serialize<TRecord>(TRecord record) =>
         JsonSerializer.SerializeToElement(record, StorageJson.Options);

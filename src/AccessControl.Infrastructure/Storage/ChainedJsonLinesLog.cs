@@ -6,6 +6,9 @@ using Microsoft.Extensions.Logging;
 
 namespace AccessControl.Infrastructure.Storage;
 
+/// <summary>The newest entry of a chain: its sequence number and hash.</summary>
+internal sealed record ChainHead(long Sequence, string Hash);
+
 /// <summary>
 /// Append-only JSON Lines log with a tamper-evident hash chain and size-based rotation.
 /// <para>
@@ -18,8 +21,9 @@ namespace AccessControl.Infrastructure.Storage;
 /// retention (<see cref="AuditChainAnchor"/>); a chain that starts anywhere else had its oldest entries removed.
 /// </para>
 /// <para>
-/// Appends are serialized and fully written (optionally fsync'd) before returning. A torn final line from a
-/// crash is terminated on startup and skipped on read; the chain continues from the last complete entry.
+/// Appends are serialized and fully written (optionally fsync'd) before returning. A failed append is cut off the
+/// file again, so the file never holds a partial batch; a torn final line from a crash is terminated on startup and
+/// skipped on read, and the chain continues from the last complete entry.
 /// </para>
 /// </summary>
 internal sealed partial class ChainedJsonLinesLog : IDisposable
@@ -27,53 +31,61 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
     private static readonly byte[] NewLine = "\n"u8.ToArray();
 
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private readonly ConcurrentQueue<(IReadOnlyList<byte[]> Payloads, TaskCompletionSource Appended)> _queued = new();
+    private readonly ConcurrentQueue<(IReadOnlyList<byte[]> Payloads, TaskCompletionSource<long> Appended)> _queued = new();
     private readonly AuditLogSegments _segments;
     private readonly AuditChainHasher _hasher;
     private readonly bool _flushToDisk;
+    private readonly ILogger _logger;
 
     // Time range of each archived segment, by path; the stamp (length, last write) detects a replaced file.
     private readonly ConcurrentDictionary<string, ((long Length, DateTime LastWrite) Stamp, SegmentTimeRange Range)> _segmentTimes = new();
 
-    // Chain head. Only changed under _gate, after the line is on disk.
-    private long _lastSequence;
-    private string _lastHash;
+    // Only replaced under _gate, after the line is on disk. Read lock-free (e.g. by the store's checkpoint).
+    private ChainHead _head;
     private bool _mayBeTorn;
 
-    public ChainedJsonLinesLog(string name, StorageOptions options, TimeProvider clock, ILogger logger)
+    /// <param name="directory">Held for the life of the log, so no other process writes the same files.</param>
+    public ChainedJsonLinesLog(string name, DataDirectoryLock directory, StorageOptions options, TimeProvider clock, ILogger logger)
     {
+        ArgumentNullException.ThrowIfNull(directory);
         ArgumentNullException.ThrowIfNull(options);
         Name = name;
+        _logger = logger;
         _hasher = new AuditChainHasher(options.AuditHmacKey);
-        _segments = new AuditLogSegments(name, options, clock, _hasher, logger);
+        _segments = new AuditLogSegments(name, directory.DirectoryPath, options, clock, _hasher, logger);
         _flushToDisk = options.FlushAuditToDisk;
 
         _segments.TerminateTornLine();
-        (_lastSequence, _lastHash) = _segments.FindChainHead();
+        _head = _segments.FindChainHead();
         _segments.ApplyRetention();
 
         // Shipped with the application logs, this lets someone off the host notice that the newest entries were
         // removed while the service was stopped (the chain itself cannot show that).
-        Log.ChainHead(logger, name, _lastSequence, _lastHash);
+        Log.ChainHead(logger, name, _head.Sequence, _head.Hash);
     }
 
     public string Name { get; }
 
-    public Task AppendAsync(byte[] payload, CancellationToken cancellationToken)
+    /// <summary>The newest entry on disk.</summary>
+    public ChainHead Head => Volatile.Read(ref _head);
+
+    /// <summary>Appends one entry and returns its sequence number once it is on disk.</summary>
+    public Task<long> AppendAsync(byte[] payload, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return AppendAsync([payload]);
     }
 
     /// <summary>
-    /// Appends entries in order, contiguously, and returns once they are on disk. Group commit: callers queue their
-    /// entries, and whoever holds the gate next writes everything queued in one write and one flush, so concurrent
-    /// badge reads share an fsync instead of waiting for one each. Not cancellable once queued: the entry may already
-    /// be part of another caller's write, and a half-recorded audit trail is worse than a slow response.
+    /// Appends entries in order, contiguously, and returns the sequence number of the last one once they are on disk.
+    /// Group commit: callers queue their entries, and whoever holds the gate next writes everything queued in one write
+    /// and one flush, so concurrent badge reads share an fsync instead of waiting for one each. Not cancellable once
+    /// queued: the entry may already be part of another caller's write, and a half-recorded audit trail is worse than
+    /// a slow response.
     /// </summary>
-    public async Task AppendAsync(IReadOnlyList<byte[]> payloads)
+    public async Task<long> AppendAsync(IReadOnlyList<byte[]> payloads)
     {
-        var appended = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var appended = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
         _queued.Enqueue((payloads, appended));
 
         await _gate.WaitAsync().ConfigureAwait(false);
@@ -89,20 +101,59 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
             _gate.Release();
         }
 
-        await appended.Task.ConfigureAwait(false);
+        return await appended.Task.ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The verified entries after <paramref name="sequence"/>, oldest first, for replaying a checkpoint. The first one
+    /// must follow <paramref name="hash"/> and each must follow the previous one with a valid hash: replaying an
+    /// altered or incomplete history would silently install configuration nobody made, so any break throws.
+    /// A torn final line from a crash is skipped. Startup only: callers must not append concurrently.
+    /// </summary>
+    /// <exception cref="InvalidDataException">The entries after <paramref name="sequence"/> are missing or broken.</exception>
+    public IEnumerable<(long Sequence, JsonElement Data)> ReadAfter(long sequence, string hash)
+    {
+        var segments = _segments.OpenAll(afterSequence: sequence);
+        var (expectedSequence, expectedPrevious) = (sequence + 1, hash);
+        foreach (var line in _segments.ReadLinesAsync(segments, CancellationToken.None).ToBlockingEnumerable())
+        {
+            if (line.Kind != AuditLineKind.Chained || line.Sequence <= sequence)
+            {
+                continue;
+            }
+
+            if (line.Sequence != expectedSequence
+                || !string.Equals(line.Previous, expectedPrevious, StringComparison.Ordinal)
+                || !_hasher.IsValid(line.Sequence, line.Previous!, line.RawData!, line.Hash!))
+            {
+                throw new InvalidDataException(
+                    $"{Name}: {line.Location} does not continue the chain from entry {expectedSequence - 1}; " +
+                    "the entries needed to recover the store are missing or were altered. Run audit/verify.");
+            }
+
+            yield return (line.Sequence, line.Data);
+            (expectedSequence, expectedPrevious) = (line.Sequence + 1, line.Hash!);
+        }
+
+        if (expectedSequence - 1 < Head.Sequence)
+        {
+            throw new InvalidDataException(
+                $"{Name}: entries {expectedSequence} to {Head.Sequence} could not be read; cannot recover the store.");
+        }
     }
 
     private void WriteQueuedLocked()
     {
-        var batch = new List<(IReadOnlyList<byte[]> Payloads, TaskCompletionSource Appended)>();
+        var batch = new List<(IReadOnlyList<byte[]> Payloads, TaskCompletionSource<long> Appended)>();
         while (_queued.TryDequeue(out var item))
         {
             batch.Add(item);
         }
 
+        long first;
         try
         {
-            WriteLocked(batch.SelectMany(b => b.Payloads).ToList());
+            first = WriteLocked(batch.SelectMany(b => b.Payloads).ToList());
         }
         catch (Exception ex)
         {
@@ -110,14 +161,20 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
             return;
         }
 
-        batch.ForEach(b => b.Appended.SetResult());
+        var last = first - 1;
+        foreach (var (payloads, appended) in batch)
+        {
+            last += payloads.Count;
+            appended.SetResult(last);
+        }
     }
 
     /// <summary>
     /// Returns the matching entries newest first. Streams every segment that may hold entries in
     /// [<paramref name="from"/>, <paramref name="to"/>) and keeps only the requested page in memory (see
     /// <see cref="NewestFirstPage{T}"/>). Archived segments are immutable, so their time range is remembered after
-    /// the first scan and a segment entirely outside the range is not read again.
+    /// the first scan and a segment entirely outside the range is not read again. Lines whose hash does not match
+    /// their content are left out (and logged): a query never presents an altered entry as genuine.
     /// </summary>
     public async Task<PagedResult<T>> QueryAsync<TRecord, T>(
         Func<TRecord, T> map,
@@ -129,11 +186,14 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
         CancellationToken cancellationToken)
     {
         var (segments, _) = await OpenSegmentsAsync(cancellationToken).ConfigureAwait(false);
+        ForgetRemovedSegments(segments);
+        var result = new NewestFirstPage<T>(page);
+        long position = 0;
+
+        // ReadLinesAsync disposes each segment's stream; the ones skipped here are disposed below.
+        var unread = new List<FileStream>();
         try
         {
-            ForgetRemovedSegments(segments);
-            var result = new NewestFirstPage<T>(page);
-            long position = 0;
             foreach (var segment in segments)
             {
                 var isArchived = segment.Path != _segments.ActivePath;
@@ -143,14 +203,25 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
                     && known.Stamp == stamp
                     && !known.Range.Overlaps(from, to))
                 {
+                    unread.Add(segment.Stream);
                     continue;
                 }
 
                 var range = SegmentTimeRange.Empty;
-                await foreach (var line in _segments.ReadLinesAsync([segment], includeRaw: false, cancellationToken).ConfigureAwait(false))
+                await foreach (var line in _segments.ReadLinesAsync([segment], cancellationToken).ConfigureAwait(false))
                 {
-                    if (line.Kind != AuditLineKind.Chained
-                        || line.Data.Deserialize<TRecord>(StorageJson.Options) is not { } record)
+                    if (line.Kind != AuditLineKind.Chained)
+                    {
+                        continue;
+                    }
+
+                    if (!_hasher.IsValid(line.Sequence, line.Previous!, line.RawData!, line.Hash!))
+                    {
+                        Log.TamperedLineSkipped(_logger, line.Location);
+                        continue;
+                    }
+
+                    if (line.Data.Deserialize<TRecord>(StorageJson.Options) is not { } record)
                     {
                         continue;
                     }
@@ -175,7 +246,7 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
         }
         finally
         {
-            foreach (var (_, stream) in segments)
+            foreach (var stream in unread)
             {
                 await stream.DisposeAsync().ConfigureAwait(false);
             }
@@ -195,10 +266,15 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
 
         if (anchor is not null && !_hasher.IsValid(anchor))
         {
+            foreach (var (_, stream) in segments)
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+            }
+
             return Broken("The retention anchor does not match its signature; it was modified.");
         }
 
-        await foreach (var line in _segments.ReadLinesAsync(segments, includeRaw: true, cancellationToken).ConfigureAwait(false))
+        await foreach (var line in _segments.ReadLinesAsync(segments, cancellationToken).ConfigureAwait(false))
         {
             switch (line.Kind)
             {
@@ -256,16 +332,18 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
 
     public void Dispose() => _gate.Dispose();
 
-    private void WriteLocked(List<byte[]> payloads)
+    /// <summary>Writes the entries as one block and returns the first one's sequence number.</summary>
+    private long WriteLocked(List<byte[]> payloads)
     {
+        var start = Head;
         if (payloads.Count == 0)
         {
-            return;
+            return start.Sequence + 1;
         }
 
         var buffer = new ArrayBufferWriter<byte>();
-        var sequence = _lastSequence;
-        var hash = _lastHash;
+        var sequence = start.Sequence;
+        var hash = start.Hash;
         foreach (var payload in payloads)
         {
             sequence++;
@@ -285,32 +363,50 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
             hash = next;
         }
 
-        try
+        if (_mayBeTorn)
         {
-            if (_mayBeTorn)
-            {
-                _segments.TerminateTornLine();
-                _mayBeTorn = false;
-            }
+            _segments.TerminateTornLine();
+            _mayBeTorn = false;
+        }
 
-            _segments.RotateIfFull(_lastSequence);
-            using (var stream = new FileStream(
-                _segments.ActivePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+        _segments.RotateIfFull(start.Sequence);
+
+        using (var stream = new FileStream(
+            _segments.ActivePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+        {
+            var originalLength = stream.Seek(0, SeekOrigin.End);
+            try
             {
                 stream.Write(buffer.WrittenSpan);
                 stream.Flush(flushToDisk: _flushToDisk);
             }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Part of the batch may have reached the disk. Cut it off again, so the file still ends at the head
+                // and nobody can mistake an entry the caller was told failed for one that was recorded.
+                Truncate(stream, originalLength);
+                throw;
+            }
+        }
+
+        Volatile.Write(ref _head, new ChainHead(sequence, hash));
+        return start.Sequence + 1;
+    }
+
+    private void Truncate(FileStream stream, long length)
+    {
+        try
+        {
+            stream.SetLength(length);
+            stream.Flush(flushToDisk: _flushToDisk);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Part of the batch may have reached the disk. Resynchronise the head with what is actually there.
+            // Could not cut the partial write off: rescan for the real head and end the torn line before the next append.
+            Log.TruncateFailed(_logger, ex, _segments.ActivePath);
             _mayBeTorn = true;
-            (_lastSequence, _lastHash) = _segments.FindChainHead();
-            throw;
+            Volatile.Write(ref _head, _segments.FindChainHead());
         }
-
-        _lastSequence = sequence;
-        _lastHash = hash;
     }
 
     /// <summary>Drops remembered time ranges of segments that retention has deleted.</summary>
@@ -332,7 +428,7 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return (_segments.OpenAll(), _lastSequence);
+            return (_segments.OpenAll(), Head.Sequence);
         }
         finally
         {
@@ -344,6 +440,12 @@ internal sealed partial class ChainedJsonLinesLog : IDisposable
     {
         [LoggerMessage(EventId = 3104, Level = LogLevel.Information, Message = "Audit log {Log} chain head: entry {Sequence}, hash {Hash}")]
         public static partial void ChainHead(ILogger logger, string log, long sequence, string hash);
+
+        [LoggerMessage(EventId = 3105, Level = LogLevel.Warning, Message = "Audit query skipped {Location}: its hash does not match its content (run audit/verify)")]
+        public static partial void TamperedLineSkipped(ILogger logger, string location);
+
+        [LoggerMessage(EventId = 3106, Level = LogLevel.Error, Message = "Could not remove a failed append from {Path}; the partial line will be terminated before the next append")]
+        public static partial void TruncateFailed(ILogger logger, Exception exception, string path);
     }
 
     /// <summary>Earliest and latest timestamp in a segment; both <c>null</c> when it holds no readable entry.</summary>

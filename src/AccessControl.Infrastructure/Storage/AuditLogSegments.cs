@@ -27,11 +27,13 @@ internal sealed partial class AuditLogSegments
     private readonly string _anchorPath;
     private readonly ILogger _logger;
 
-    public AuditLogSegments(string name, StorageOptions options, TimeProvider clock, AuditChainHasher hasher, ILogger logger)
+    /// <summary>Entry payloads name their timestamp with this property; retention reads it.</summary>
+    private const string TimestampProperty = "occurredAt";
+
+    public AuditLogSegments(string name, string directory, StorageOptions options, TimeProvider clock, AuditChainHasher hasher, ILogger logger)
     {
         _name = name;
-        _directory = Path.GetFullPath(options.DataDirectory);
-        Directory.CreateDirectory(_directory);
+        _directory = directory;
         ActivePath = Path.Combine(_directory, name + Extension);
         _archivedName = new Regex($"^{Regex.Escape(name)}\\.[0-9]+{Regex.Escape(Extension)}$", RegexOptions.CultureInvariant);
         _segmentMaxBytes = options.AuditSegmentMaxBytes > 0 ? options.AuditSegmentMaxBytes : long.MaxValue;
@@ -56,15 +58,17 @@ internal sealed partial class AuditLogSegments
 
         var archived = Path.Combine(
             _directory, $"{_name}.{lastSequence.ToString("D12", CultureInfo.InvariantCulture)}{Extension}");
-        File.Move(ActivePath, archived);
+        DurableFile.Move(ActivePath, archived);
         Log.Rotated(_logger, _name, Path.GetFileName(archived));
         ApplyRetention();
     }
 
     /// <summary>
     /// Deletes expired archived segments, oldest first, stopping at the first one still within the retention period
-    /// so that what remains is always an unbroken chain. Before deleting, records the newest entry being removed as the
-    /// signed <see cref="AuditChainAnchor"/> that verification continues from.
+    /// so that what remains is always an unbroken chain. A segment's age is the timestamp of its newest entry, not the
+    /// file's modification time (which copies, restores and <c>touch</c> change); a segment whose newest entry cannot be
+    /// read is kept. Before deleting, records the newest entry being removed as the signed
+    /// <see cref="AuditChainAnchor"/> that verification continues from.
     /// </summary>
     public void ApplyRetention()
     {
@@ -73,8 +77,8 @@ internal sealed partial class AuditLogSegments
             return;
         }
 
-        var cutoff = _clock.GetUtcNow().UtcDateTime.AddDays(-days);
-        var expired = Archived().TakeWhile(path => File.GetLastWriteTimeUtc(path) < cutoff).ToList();
+        var cutoff = _clock.GetUtcNow().AddDays(-days);
+        var expired = Archived().TakeWhile(path => NewestTimestampIn(path) is { } newest && newest < cutoff).ToList();
         if (expired.Count == 0)
         {
             return;
@@ -91,6 +95,8 @@ internal sealed partial class AuditLogSegments
             File.Delete(path);
             Log.SegmentExpired(_logger, _name, Path.GetFileName(path), days);
         }
+
+        DurableFile.FlushDirectory(_directory);
     }
 
     /// <summary>The anchor left by retention, or <c>null</c> if retention has never removed anything.</summary>
@@ -112,16 +118,32 @@ internal sealed partial class AuditLogSegments
         }
     }
 
-    private void WriteAnchor(AuditChainAnchor anchor)
+    private void WriteAnchor(AuditChainAnchor anchor) =>
+        DurableFile.Replace(_anchorPath, stream => JsonSerializer.Serialize(stream, anchor, StorageJson.Options));
+
+    /// <summary>The timestamp of the newest entry in a segment, read from the end of the file; <c>null</c> if unreadable.</summary>
+    private static DateTimeOffset? NewestTimestampIn(string path)
     {
-        var temp = _anchorPath + ".tmp";
-        using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+        const int TailBytes = 256 * 1024;
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var length = (int)Math.Min(stream.Length, TailBytes);
+        stream.Seek(-length, SeekOrigin.End);
+        var buffer = new byte[length];
+        stream.ReadExactly(buffer);
+
+        var lines = Encoding.UTF8.GetString(buffer).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        for (var i = lines.Length - 1; i >= 0; i--)
         {
-            JsonSerializer.Serialize(stream, anchor, StorageJson.Options);
-            stream.Flush(flushToDisk: true);
+            var line = AuditLogLine.Parse(path, 0, lines[i], includeRaw: false);
+            if (line.Kind == AuditLineKind.Chained
+                && line.Data.TryGetProperty(TimestampProperty, out var value)
+                && value.TryGetDateTimeOffset(out var timestamp))
+            {
+                return timestamp;
+            }
         }
 
-        File.Move(temp, _anchorPath, overwrite: true);
+        return null;
     }
 
     /// <summary>If the process died mid-append, end the torn line so the next append starts cleanly.</summary>
@@ -151,7 +173,7 @@ internal sealed partial class AuditLogSegments
     /// The newest complete chained entry: in the active file, else in the newest archived segment, else the
     /// retention anchor (everything was deleted), else the start of a new chain.
     /// </summary>
-    public (long Sequence, string Hash) FindChainHead()
+    public ChainHead FindChainHead()
     {
         var newestFirst = Archived();
         newestFirst.Reverse();
@@ -159,13 +181,13 @@ internal sealed partial class AuditLogSegments
         {
             if (LastEntryIn(path) is { } found)
             {
-                return found;
+                return new ChainHead(found.Sequence, found.Hash);
             }
         }
 
         return ReadAnchor() is { } anchor && _hasher.IsValid(anchor)
-            ? (anchor.Sequence, anchor.Hash)
-            : (0, AuditChainHasher.EmptyHash);
+            ? new ChainHead(anchor.Sequence, anchor.Hash)
+            : new ChainHead(0, AuditChainHasher.EmptyHash);
     }
 
     private static (long Sequence, string Hash)? LastEntryIn(string path)
@@ -199,12 +221,14 @@ internal sealed partial class AuditLogSegments
     /// Opens every segment, oldest first. Open handles survive a later rotation or retention, so a reader
     /// neither misses nor repeats a segment. The caller owns the streams; <see cref="ReadLinesAsync"/> disposes them.
     /// </summary>
-    public List<(string Path, FileStream Stream)> OpenAll()
+    /// <param name="afterSequence">Skip archived segments that end at or before this entry (their names say where they end).</param>
+    public List<(string Path, FileStream Stream)> OpenAll(long afterSequence = 0)
     {
         var segments = new List<(string, FileStream)>();
         try
         {
-            foreach (var path in Archived().Append(ActivePath))
+            var archived = Archived().Where(path => afterSequence == 0 || LastSequenceInName(path) > afterSequence);
+            foreach (var path in archived.Append(ActivePath))
             {
                 try
                 {
@@ -234,7 +258,6 @@ internal sealed partial class AuditLogSegments
     /// <summary>Every non-empty line of the opened segments, in order. Disposes the streams when done.</summary>
     public async IAsyncEnumerable<AuditLogLine> ReadLinesAsync(
         List<(string Path, FileStream Stream)> segments,
-        bool includeRaw,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         try
@@ -251,7 +274,7 @@ internal sealed partial class AuditLogSegments
                         continue;
                     }
 
-                    var line = AuditLogLine.Parse(path, lineNumber, text, includeRaw);
+                    var line = AuditLogLine.Parse(path, lineNumber, text, includeRaw: true);
                     if (line.Kind == AuditLineKind.Corrupt)
                     {
                         Log.CorruptLine(_logger, lineNumber, path);
@@ -268,6 +291,13 @@ internal sealed partial class AuditLogSegments
                 await stream.DisposeAsync().ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>The sequence number in an archived segment's name: its newest entry.</summary>
+    private static long LastSequenceInName(string path)
+    {
+        var name = Path.GetFileNameWithoutExtension(path);
+        return long.Parse(name[(name.LastIndexOf('.') + 1)..], CultureInfo.InvariantCulture);
     }
 
     /// <summary>Archived segments oldest first. Their names embed a zero-padded sequence number.</summary>

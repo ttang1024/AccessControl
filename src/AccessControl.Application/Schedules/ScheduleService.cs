@@ -11,19 +11,17 @@ public sealed record TimeWindowDto(DayOfWeek Day, string Start, string End);
 
 public sealed record ScheduleRequest(string? Name, string? TimeZone, IReadOnlyList<TimeWindowDto>? Windows);
 
-public sealed record ScheduleView(Guid Id, string Name, string TimeZone, IReadOnlyList<TimeWindowDto> Windows)
+public sealed record ScheduleView(Guid Id, string Name, string TimeZone, IReadOnlyList<TimeWindowDto> Windows, int Version) : IVersioned
 {
-    public static ScheduleView From(Schedule s) =>
+    public static ScheduleView From(Schedule s, int version) =>
         new(s.Id, s.Name, s.TimeZone.Id,
             s.Windows
                 .Select(w => new TimeWindowDto(w.Day, WeeklyTimeWindow.Format(w.Start), WeeklyTimeWindow.Format(w.End)))
-                .ToList());
+                .ToList(),
+            version);
 }
 
-public sealed class ScheduleService(
-    IScheduleRepository schedules,
-    IAccessGroupRepository accessGroups,
-    IUnitOfWork unitOfWork)
+public sealed class ScheduleService(IScheduleRepository schedules, IUnitOfWork unitOfWork)
 {
     private const string Resource = ResourceNames.Schedule;
     private const int MaxWindows = 200;
@@ -34,44 +32,35 @@ public sealed class ScheduleService(
         var schedule = Schedule.Create(Guid.NewGuid(), request.Name, request.TimeZone, ToWindows(request.Windows));
         schedules.Add(schedule);
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return ScheduleView.From(schedule);
+        return View(schedule);
     }
 
     public async Task<ScheduleView> GetAsync(Guid id, CancellationToken ct) =>
-        ScheduleView.From(await schedules.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
+        View(await schedules.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
 
-    public async Task<PagedResult<ScheduleView>> ListAsync(PageRequest page, CancellationToken ct) =>
-        PagedResult.Create(
-            (await schedules.ListAsync(ct).ConfigureAwait(false))
-                .OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(s => s.Id)
-                .Select(ScheduleView.From),
-            page);
+    public async Task<PagedResult<ScheduleView>> SearchAsync(string? text, PageRequest page, CancellationToken ct) =>
+        (await schedules.SearchAsync(text, page, ct).ConfigureAwait(false)).Map(View);
 
     /// <summary>Replaces the schedule's name, time zone and windows. Takes effect on the next badge read.</summary>
-    public async Task<ScheduleView> UpdateAsync(Guid id, ScheduleRequest request, CancellationToken ct)
+    public async Task<ScheduleView> UpdateAsync(Guid id, ScheduleRequest request, int? expectedVersion, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var schedule = await schedules.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        schedule.Rename(request.Name);
-        schedule.Redefine(request.TimeZone, ToWindows(request.Windows));
-        schedules.Update(schedule);
-        await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return ScheduleView.From(schedule);
-    }
-
-    public async Task DeleteAsync(Guid id, CancellationToken ct)
-    {
-        var schedule = await schedules.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        var groups = await accessGroups.ListByScheduleAsync(id, ct).ConfigureAwait(false);
-        if (groups.Count > 0)
+        var windows = ToWindows(request.Windows);
+        return View(await schedules.ModifyAsync(unitOfWork, id, Resource, expectedVersion, s =>
         {
-            throw ConflictException.InUseByGroups(Resource, groups.Select(g => g.Name).ToList());
-        }
+            s.Rename(request.Name);
+            s.Redefine(request.TimeZone, windows);
+        }, ct).ConfigureAwait(false));
+    }
 
-        schedules.Remove(schedule);
+    /// <summary>Deletes a schedule. Refused (<c>schedule.in_use</c>) by the store while an access group uses it.</summary>
+    public async Task DeleteAsync(Guid id, int? expectedVersion, CancellationToken ct)
+    {
+        schedules.Remove(await schedules.GetForChangeAsync(id, Resource, expectedVersion, ct).ConfigureAwait(false));
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
     }
+
+    private ScheduleView View(Schedule s) => ScheduleView.From(s, schedules.VersionOf(s));
 
     private static List<WeeklyTimeWindow> ToWindows(IReadOnlyList<TimeWindowDto>? windows)
     {

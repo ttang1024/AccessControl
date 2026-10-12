@@ -47,14 +47,3 @@ public sealed record PagedResult<T>(IReadOnlyList<T> Items, int Total, int Offse
     public PagedResult<TOut> Map<TOut>(Func<T, TOut> map) =>
         new(Items.Select(map).ToList(), Total, Offset, Limit);
 }
-
-public static class PagedResult
-{
-    /// <summary>Pages an already-ordered sequence in memory.</summary>
-    public static PagedResult<T> Create<T>(IEnumerable<T> orderedSource, PageRequest page)
-    {
-        var all = orderedSource as IReadOnlyCollection<T> ?? orderedSource.ToList();
-        var items = all.Skip(page.Offset).Take(page.Limit).ToList();
-        return new PagedResult<T>(items, all.Count, page.Offset, page.Limit);
-    }
-}

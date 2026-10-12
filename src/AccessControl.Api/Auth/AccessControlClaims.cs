@@ -11,6 +11,13 @@ public static class AccessControlClaims
     /// <summary>Development only: a controller key valid for every door.</summary>
     public const string AnyDoor = "*";
 
+    /// <summary>Who the caller is, for the change trail and rate limits: the API key's name.</summary>
+    public static string? ActorName(this ClaimsPrincipal user)
+    {
+        ArgumentNullException.ThrowIfNull(user);
+        return user.Identity is { IsAuthenticated: true, Name: { Length: > 0 } name } ? name : null;
+    }
+
     public static bool MayUseDoor(this ClaimsPrincipal user, Guid doorId)
     {
         ArgumentNullException.ThrowIfNull(user);

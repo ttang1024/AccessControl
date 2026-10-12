@@ -1,4 +1,5 @@
-using System.Security.Claims;
+using System.Net;
+using System.Net.Sockets;
 using System.Threading.RateLimiting;
 using AccessControl.Api.Auth;
 using Microsoft.AspNetCore.Mvc;
@@ -9,8 +10,6 @@ namespace AccessControl.Api.RateLimiting;
 public sealed class RateLimitingOptions
 {
     public const string SectionName = "RateLimiting";
-
-    public bool Enabled { get; set; } = true;
 
     /// <summary>
     /// Badge reads per minute per controller key. Slows card-number enumeration with a stolen key; set it
@@ -48,25 +47,22 @@ internal static class RateLimitingSetup
             o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
             {
                 var settings = context.RequestServices.GetRequiredService<IOptions<RateLimitingOptions>>().Value;
-                if (!settings.Enabled)
-                {
-                    return RateLimitPartition.GetNoLimiter("disabled");
-                }
-
-                // Runs after authentication, so a valid key gets its own budget and everything else is per IP.
+                // Runs after authentication, so a valid caller gets its own budget and everything else is per client network.
                 var user = context.User;
-                var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+                var client = ClientPartition(context.Connection.RemoteIpAddress);
                 var (key, permits) = context.Request.Path.StartsWithSegments(HealthPath)
-                    ? ("health:" + ip, settings.AnonymousPermitsPerMinute)
-                    : user.Identity?.IsAuthenticated == true
-                        ? ("key:" + user.FindFirstValue(ClaimTypes.Name),
+                    ? ("health:" + client, settings.AnonymousPermitsPerMinute)
+                    : user.ActorName() is { } actor
+                        ? ("actor:" + actor,
                             user.IsInRole(Roles.DoorController) ? settings.DoorControllerPermitsPerMinute : settings.UserPermitsPerMinute)
-                        : ("ip:" + ip, settings.AnonymousPermitsPerMinute);
+                        : ("ip:" + client, settings.AnonymousPermitsPerMinute);
 
-                return RateLimitPartition.GetFixedWindowLimiter(key, _ => new FixedWindowRateLimiterOptions
+                // Sliding window (six 10-second segments): a fixed window lets twice the limit through across a boundary.
+                return RateLimitPartition.GetSlidingWindowLimiter(key, _ => new SlidingWindowRateLimiterOptions
                 {
                     PermitLimit = permits,
                     Window = TimeSpan.FromMinutes(1),
+                    SegmentsPerWindow = 6,
                     QueueLimit = 0,
                 });
             });
@@ -90,5 +86,31 @@ internal static class RateLimitingSetup
             };
         });
         return services;
+    }
+
+    /// <summary>
+    /// The rate-limit partition for a client address. IPv6 clients usually control a whole /64 and can rotate through
+    /// it at will, so they are grouped by /64; IPv4-mapped addresses count as their IPv4 address.
+    /// </summary>
+    public static string ClientPartition(IPAddress? address)
+    {
+        if (address is null)
+        {
+            return "unknown";
+        }
+
+        if (address.IsIPv4MappedToIPv6)
+        {
+            return address.MapToIPv4().ToString();
+        }
+
+        if (address.AddressFamily != AddressFamily.InterNetworkV6)
+        {
+            return address.ToString();
+        }
+
+        var bytes = address.GetAddressBytes();
+        Array.Clear(bytes, 8, 8);
+        return new IPAddress(bytes) + "/64";
     }
 }

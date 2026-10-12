@@ -8,73 +8,73 @@ public sealed record IssueCredentialRequest(string? CardNumber, DateTimeOffset? 
 
 public sealed record ChangeCredentialExpiryRequest(DateTimeOffset? ExpiresAt);
 
+/// <param name="CardNumber">Masked (see <see cref="CardNumberMask"/>): the full number is never stored.</param>
 public sealed record CredentialView(
     Guid Id,
     Guid CardholderId,
     string CardNumber,
     CredentialStatus Status,
     DateTimeOffset IssuedAt,
-    DateTimeOffset? ExpiresAt)
+    DateTimeOffset? ExpiresAt,
+    int Version) : IVersioned
 {
-    public static CredentialView From(Credential c) =>
-        new(c.Id, c.CardholderId, CardNumberMask.Mask(c.CardNumber.Value), c.Status, c.IssuedAt, c.ExpiresAt);
+    public static CredentialView From(Credential c, int version) =>
+        new(c.Id, c.CardholderId, CardNumberMask.Display(c.Card.Hint), c.Status, c.IssuedAt, c.ExpiresAt, version);
 }
 
 public sealed class CredentialService(
     ICredentialRepository credentials,
     ICardholderRepository cardholders,
+    ICardNumberProtector protector,
     IUnitOfWork unitOfWork,
     TimeProvider clock)
 {
     private const string Resource = ResourceNames.Credential;
 
     /// <summary>
-    /// Issues a card to a cardholder. Card numbers are unique for life: the check here gives a clear
-    /// error, and the store enforces the same rule atomically at commit time to close the race.
+    /// Issues a card to a cardholder. Card numbers are unique for life and the cardholder must exist; the store
+    /// enforces both atomically at commit (<c>credential.duplicate_card_number</c>, <c>cardholder.not_found</c>).
     /// </summary>
     public async Task<CredentialView> IssueAsync(Guid cardholderId, IssueCredentialRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var cardNumber = CardNumber.Parse(request.CardNumber);
-        await cardholders.GetRequiredAsync(cardholderId, ResourceNames.Cardholder, ct).ConfigureAwait(false);
-
-        if (await credentials.FindByCardNumberAsync(cardNumber, ct).ConfigureAwait(false) is not null)
-        {
-            throw ConflictException.DuplicateCardNumber(cardNumber.Value);
-        }
-
-        var credential = Credential.Issue(
-            Guid.NewGuid(), cardholderId, cardNumber, clock.GetUtcNow(), request.ExpiresAt);
+        var card = protector.Protect(CardNumber.Parse(request.CardNumber));
+        var credential = Credential.Issue(Guid.NewGuid(), cardholderId, card, clock.GetUtcNow(), request.ExpiresAt);
 
         credentials.Add(credential);
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return CredentialView.From(credential);
+        return View(credential);
     }
 
     public async Task<CredentialView> GetAsync(Guid id, CancellationToken ct) =>
-        CredentialView.From(await credentials.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
+        View(await credentials.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
 
     public async Task<IReadOnlyList<CredentialView>> ListForCardholderAsync(Guid cardholderId, CancellationToken ct)
     {
         await cardholders.GetRequiredAsync(cardholderId, ResourceNames.Cardholder, ct).ConfigureAwait(false);
-        var list = await credentials.ListByCardholderAsync(cardholderId, ct).ConfigureAwait(false);
-        return list.OrderBy(c => c.IssuedAt).Select(CredentialView.From).ToList();
+        return (await credentials.ListByCardholderAsync(cardholderId, ct).ConfigureAwait(false)).Select(View).ToList();
     }
 
-    public Task<CredentialView> SuspendAsync(Guid id, CancellationToken ct) => ModifyAsync(id, c => c.Suspend(), ct);
+    public Task<CredentialView> SuspendAsync(Guid id, int? expectedVersion, CancellationToken ct) =>
+        ModifyAsync(id, expectedVersion, c => c.Suspend(), ct);
 
-    public Task<CredentialView> ReinstateAsync(Guid id, CancellationToken ct) => ModifyAsync(id, c => c.Reinstate(), ct);
+    public Task<CredentialView> ReinstateAsync(Guid id, int? expectedVersion, CancellationToken ct) =>
+        ModifyAsync(id, expectedVersion, c => c.Reinstate(), ct);
 
-    public Task<CredentialView> ReportLostAsync(Guid id, CancellationToken ct) => ModifyAsync(id, c => c.ReportLost(), ct);
+    public Task<CredentialView> ReportLostAsync(Guid id, int? expectedVersion, CancellationToken ct) =>
+        ModifyAsync(id, expectedVersion, c => c.ReportLost(), ct);
 
-    public Task<CredentialView> RevokeAsync(Guid id, CancellationToken ct) => ModifyAsync(id, c => c.Revoke(), ct);
+    public Task<CredentialView> RevokeAsync(Guid id, int? expectedVersion, CancellationToken ct) =>
+        ModifyAsync(id, expectedVersion, c => c.Revoke(), ct);
 
-    public Task<CredentialView> ChangeExpiryAsync(Guid id, ChangeCredentialExpiryRequest request, CancellationToken ct)
+    public Task<CredentialView> ChangeExpiryAsync(Guid id, ChangeCredentialExpiryRequest request, int? expectedVersion, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return ModifyAsync(id, c => c.ChangeExpiry(request.ExpiresAt), ct);
+        return ModifyAsync(id, expectedVersion, c => c.ChangeExpiry(request.ExpiresAt), ct);
     }
 
-    private async Task<CredentialView> ModifyAsync(Guid id, Action<Credential> change, CancellationToken ct) =>
-        CredentialView.From(await credentials.ModifyAsync(unitOfWork, id, Resource, change, ct).ConfigureAwait(false));
+    private CredentialView View(Credential c) => CredentialView.From(c, credentials.VersionOf(c));
+
+    private async Task<CredentialView> ModifyAsync(Guid id, int? expectedVersion, Action<Credential> change, CancellationToken ct) =>
+        View(await credentials.ModifyAsync(unitOfWork, id, Resource, expectedVersion, change, ct).ConfigureAwait(false));
 }

@@ -34,4 +34,12 @@ public sealed class CardNumberTests
     {
         Assert.Equal(CardNumber.Parse("ab:cd"), CardNumber.Parse("ABCD"));
     }
+
+    [Fact]
+    public void Leading_zeros_are_significant()
+    {
+        // Different widths can be different card formats: never merge them (fail closed).
+        Assert.NotEqual(CardNumber.Parse("000A1B"), CardNumber.Parse("0A1B"));
+        Assert.Equal("000A1B", CardNumber.Parse("00:0a:1b").Value);
+    }
 }

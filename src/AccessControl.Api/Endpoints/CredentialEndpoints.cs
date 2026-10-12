@@ -1,5 +1,6 @@
 using AccessControl.Api.Auth;
 using AccessControl.Application.Credentials;
+using Microsoft.AspNetCore.Mvc;
 
 namespace AccessControl.Api.Endpoints;
 
@@ -13,11 +14,15 @@ internal static class CredentialEndpoints
         var enrol = g.WithPolicy(Policies.Enrol);
 
         read.MapGet("/{id:guid}", (Guid id, CredentialService s, CancellationToken ct) => s.GetAsync(id, ct));
-        enrol.MapPut("/{id:guid}/expiry", (Guid id, ChangeCredentialExpiryRequest body, CredentialService s, CancellationToken ct) =>
-            s.ChangeExpiryAsync(id, body, ct));
-        enrol.MapPost("/{id:guid}/suspend", (Guid id, CredentialService s, CancellationToken ct) => s.SuspendAsync(id, ct));
-        enrol.MapPost("/{id:guid}/reinstate", (Guid id, CredentialService s, CancellationToken ct) => s.ReinstateAsync(id, ct));
-        enrol.MapPost("/{id:guid}/report-lost", (Guid id, CredentialService s, CancellationToken ct) => s.ReportLostAsync(id, ct));
-        enrol.MapPost("/{id:guid}/revoke", (Guid id, CredentialService s, CancellationToken ct) => s.RevokeAsync(id, ct));
+        enrol.MapPut("/{id:guid}/expiry", (Guid id, ChangeCredentialExpiryRequest body, [FromHeader(Name = ETags.IfMatchHeader)] string? ifMatch, CredentialService s, CancellationToken ct) =>
+            s.ChangeExpiryAsync(id, body, ETags.ParseIfMatch(ifMatch), ct));
+        enrol.MapPost("/{id:guid}/suspend", (Guid id, [FromHeader(Name = ETags.IfMatchHeader)] string? ifMatch, CredentialService s, CancellationToken ct) =>
+            s.SuspendAsync(id, ETags.ParseIfMatch(ifMatch), ct));
+        enrol.MapPost("/{id:guid}/reinstate", (Guid id, [FromHeader(Name = ETags.IfMatchHeader)] string? ifMatch, CredentialService s, CancellationToken ct) =>
+            s.ReinstateAsync(id, ETags.ParseIfMatch(ifMatch), ct));
+        enrol.MapPost("/{id:guid}/report-lost", (Guid id, [FromHeader(Name = ETags.IfMatchHeader)] string? ifMatch, CredentialService s, CancellationToken ct) =>
+            s.ReportLostAsync(id, ETags.ParseIfMatch(ifMatch), ct));
+        enrol.MapPost("/{id:guid}/revoke", (Guid id, [FromHeader(Name = ETags.IfMatchHeader)] string? ifMatch, CredentialService s, CancellationToken ct) =>
+            s.RevokeAsync(id, ETags.ParseIfMatch(ifMatch), ct));
     }
 }

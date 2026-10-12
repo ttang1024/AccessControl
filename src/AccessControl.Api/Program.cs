@@ -12,7 +12,6 @@ using AccessControl.Infrastructure.Storage;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HostFiltering;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -22,8 +21,7 @@ builder.Services
     .AddAccessControlInfrastructure(builder.Configuration);
 
 builder.Services.AddHttpContextAccessor();
-// Replaces the application default (SystemActor) explicitly instead of relying on "last registration wins".
-builder.Services.Replace(ServiceDescriptor.Singleton<IActorContext, HttpActorContext>());
+builder.Services.AddSingleton<IActorContext, HttpActorContext>();
 
 builder.Services.AddOptions<ApiKeyOptions>()
     .Bind(builder.Configuration.GetSection(ApiKeyOptions.SectionName))
@@ -76,10 +74,18 @@ app.UseAuthorization();
 app.MapHealthChecks(RateLimitingSetup.HealthPath).AllowAnonymous();
 app.MapHealthChecks(RateLimitingSetup.HealthPath + "/live", new HealthCheckOptions { Predicate = _ => false }).AllowAnonymous();
 
-app.MapGroup("/api/v1")
-    .MapAdminEndpoints()
-    .MapAccessEndpoints()
-    .MapAuditEndpoints();
+var api = app.MapGroup("/api/v1").WithETags();
+
+// Management API. Each resource is split into groups by policy (see Policies): add a route to the group whose policy
+// matches what it does, never directly to the resource group.
+api.MapCardholderEndpoints();
+api.MapCredentialEndpoints();
+api.MapDoorEndpoints();
+api.MapScheduleEndpoints();
+api.MapAccessGroupEndpoints();
+
+api.MapAccessEndpoints();
+api.MapAuditEndpoints();
 
 app.Run();
 

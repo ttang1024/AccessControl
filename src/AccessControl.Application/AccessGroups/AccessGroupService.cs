@@ -5,17 +5,21 @@ using AccessControl.Domain.AccessGroups;
 
 namespace AccessControl.Application.AccessGroups;
 
-public sealed record AccessGroupRequest(string? Name, Guid ScheduleId);
+/// <param name="Restricted">Only administrators may add members (sensitive doors). Defaults to false.</param>
+public sealed record AccessGroupRequest(string? Name, Guid ScheduleId, bool? Restricted = null);
 
-public sealed record AccessGroupView(Guid Id, string Name, Guid ScheduleId, IReadOnlyList<Guid> DoorIds)
+public sealed record AccessGroupView(Guid Id, string Name, Guid ScheduleId, bool Restricted, IReadOnlyList<Guid> DoorIds, int Version) : IVersioned
 {
-    public static AccessGroupView From(AccessGroup g) => new(g.Id, g.Name, g.ScheduleId, g.DoorIds.Order().ToList());
+    public static AccessGroupView From(AccessGroup g, int version) =>
+        new(g.Id, g.Name, g.ScheduleId, g.IsRestricted, g.DoorIds.Order().ToList(), version);
 }
 
+/// <summary>
+/// Access groups. References (the schedule, doors) are checked by the store at commit, which reports a missing one
+/// as 404 (<c>schedule.not_found</c>, <c>door.not_found</c>).
+/// </summary>
 public sealed class AccessGroupService(
     IAccessGroupRepository accessGroups,
-    IScheduleRepository schedules,
-    IDoorRepository doors,
     ICardholderRepository cardholders,
     IUnitOfWork unitOfWork)
 {
@@ -24,69 +28,46 @@ public sealed class AccessGroupService(
     public async Task<AccessGroupView> CreateAsync(AccessGroupRequest request, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var group = AccessGroup.Create(Guid.NewGuid(), request.Name, request.ScheduleId);
-        await schedules.GetRequiredAsync(request.ScheduleId, ResourceNames.Schedule, ct).ConfigureAwait(false);
-
+        var group = AccessGroup.Create(Guid.NewGuid(), request.Name, request.ScheduleId, request.Restricted ?? false);
         accessGroups.Add(group);
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return AccessGroupView.From(group);
+        return View(group);
     }
 
     public async Task<AccessGroupView> GetAsync(Guid id, CancellationToken ct) =>
-        AccessGroupView.From(await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
+        View(await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false));
 
-    public async Task<PagedResult<AccessGroupView>> ListAsync(PageRequest page, CancellationToken ct) =>
-        PagedResult.Create(
-            (await accessGroups.ListAsync(ct).ConfigureAwait(false))
-                .OrderBy(g => g.Name, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(g => g.Id)
-                .Select(AccessGroupView.From),
-            page);
+    public async Task<PagedResult<AccessGroupView>> SearchAsync(string? text, PageRequest page, CancellationToken ct) =>
+        (await accessGroups.SearchAsync(text, page, ct).ConfigureAwait(false)).Map(View);
 
     public async Task<PagedResult<CardholderView>> ListMembersAsync(Guid id, PageRequest page, CancellationToken ct)
     {
         await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        return PagedResult.Create(
-            (await cardholders.ListByAccessGroupAsync(id, ct).ConfigureAwait(false))
-                .OrderBy(c => c.LastName, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(c => c.FirstName, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(c => c.Id)
-                .Select(CardholderView.From),
-            page);
+        return (await cardholders.SearchAsync(null, id, page, ct).ConfigureAwait(false))
+            .Map(c => CardholderView.From(c, cardholders.VersionOf(c)));
     }
 
-    public async Task<AccessGroupView> UpdateAsync(Guid id, AccessGroupRequest request, CancellationToken ct)
+    public Task<AccessGroupView> UpdateAsync(Guid id, AccessGroupRequest request, int? expectedVersion, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var group = await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        group.Rename(request.Name);
-        group.ChangeSchedule(request.ScheduleId);
-        await schedules.GetRequiredAsync(request.ScheduleId, ResourceNames.Schedule, ct).ConfigureAwait(false);
-
-        accessGroups.Update(group);
-        await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return AccessGroupView.From(group);
+        return ModifyAsync(id, expectedVersion, g =>
+        {
+            g.Rename(request.Name);
+            g.ChangeSchedule(request.ScheduleId);
+            g.SetRestricted(request.Restricted ?? false);
+        }, ct);
     }
 
-    public async Task<AccessGroupView> AddDoorAsync(Guid id, Guid doorId, CancellationToken ct)
-    {
-        var group = await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
-        await doors.GetRequiredAsync(doorId, ResourceNames.Door, ct).ConfigureAwait(false);
-        group.AddDoor(doorId);
-        accessGroups.Update(group);
-        await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
-        return AccessGroupView.From(group);
-    }
+    public Task<AccessGroupView> AddDoorAsync(Guid id, Guid doorId, int? expectedVersion, CancellationToken ct) =>
+        ModifyAsync(id, expectedVersion, g => g.AddDoor(doorId), ct);
 
-    public async Task<AccessGroupView> RemoveDoorAsync(Guid id, Guid doorId, CancellationToken ct) =>
-        AccessGroupView.From(await accessGroups
-            .ModifyAsync(unitOfWork, id, Resource, g => g.RemoveDoor(doorId), ct)
-            .ConfigureAwait(false));
+    public Task<AccessGroupView> RemoveDoorAsync(Guid id, Guid doorId, int? expectedVersion, CancellationToken ct) =>
+        ModifyAsync(id, expectedVersion, g => g.RemoveDoor(doorId), ct);
 
     /// <summary>Deletes the group and removes every member from it, in one atomic commit.</summary>
-    public async Task DeleteAsync(Guid id, CancellationToken ct)
+    public async Task DeleteAsync(Guid id, int? expectedVersion, CancellationToken ct)
     {
-        var group = await accessGroups.GetRequiredAsync(id, Resource, ct).ConfigureAwait(false);
+        var group = await accessGroups.GetForChangeAsync(id, Resource, expectedVersion, ct).ConfigureAwait(false);
         foreach (var member in await cardholders.ListByAccessGroupAsync(id, ct).ConfigureAwait(false))
         {
             member.LeaveAccessGroup(id);
@@ -96,4 +77,9 @@ public sealed class AccessGroupService(
         accessGroups.Remove(group);
         await unitOfWork.CommitAsync(ct).ConfigureAwait(false);
     }
+
+    private AccessGroupView View(AccessGroup g) => AccessGroupView.From(g, accessGroups.VersionOf(g));
+
+    private async Task<AccessGroupView> ModifyAsync(Guid id, int? expectedVersion, Action<AccessGroup> change, CancellationToken ct) =>
+        View(await accessGroups.ModifyAsync(unitOfWork, id, Resource, expectedVersion, change, ct).ConfigureAwait(false));
 }

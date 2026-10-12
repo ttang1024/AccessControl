@@ -46,6 +46,36 @@ public sealed class ScheduleTests
         Assert.False(schedule.IsActiveAt(new DateTimeOffset(2026, 10, 4, 20, 30, 0, TimeSpan.Zero)));
     }
 
+    [Fact]
+    public void Local_times_skipped_by_spring_forward_never_match_and_windows_shrink()
+    {
+        // 2026-09-27 02:00 NZST jumps to 03:00 NZDT at 14:00 UTC: local 02:00-03:00 does not exist that night.
+        var gap = Schedule.Create(Guid.NewGuid(), "Gap", "Pacific/Auckland", [Window(DayOfWeek.Sunday, "02:00", "03:00")]);
+        for (var utc = new DateTimeOffset(2026, 9, 26, 13, 0, 0, TimeSpan.Zero); utc < new DateTimeOffset(2026, 9, 26, 16, 0, 0, TimeSpan.Zero); utc = utc.AddMinutes(1))
+        {
+            Assert.False(gap.IsActiveAt(utc), $"active at {utc:u}");
+        }
+
+        // A 01:00-04:00 window covers only two real hours that night.
+        var night = Schedule.Create(Guid.NewGuid(), "Night", "Pacific/Auckland", [Window(DayOfWeek.Sunday, "01:00", "04:00")]);
+        Assert.False(night.IsActiveAt(new DateTimeOffset(2026, 9, 26, 12, 59, 0, TimeSpan.Zero)));
+        Assert.True(night.IsActiveAt(new DateTimeOffset(2026, 9, 26, 13, 0, 0, TimeSpan.Zero)));  // 01:00 NZST
+        Assert.True(night.IsActiveAt(new DateTimeOffset(2026, 9, 26, 14, 59, 0, TimeSpan.Zero))); // 03:59 NZDT
+        Assert.False(night.IsActiveAt(new DateTimeOffset(2026, 9, 26, 15, 0, 0, TimeSpan.Zero))); // 04:00 NZDT
+    }
+
+    [Fact]
+    public void Local_times_repeated_by_fall_back_match_both_times()
+    {
+        // 2027-04-04 03:00 NZDT falls back to 02:00 NZST at 14:00 UTC: local 02:00-03:00 happens twice.
+        var schedule = Schedule.Create(Guid.NewGuid(), "Twice", "Pacific/Auckland", [Window(DayOfWeek.Sunday, "02:00", "03:00")]);
+
+        Assert.False(schedule.IsActiveAt(new DateTimeOffset(2027, 4, 3, 12, 59, 0, TimeSpan.Zero)));
+        Assert.True(schedule.IsActiveAt(new DateTimeOffset(2027, 4, 3, 13, 30, 0, TimeSpan.Zero))); // 02:30 NZDT
+        Assert.True(schedule.IsActiveAt(new DateTimeOffset(2027, 4, 3, 14, 30, 0, TimeSpan.Zero))); // 02:30 NZST
+        Assert.False(schedule.IsActiveAt(new DateTimeOffset(2027, 4, 3, 15, 0, 0, TimeSpan.Zero)));  // 03:00 NZST
+    }
+
     [Theory]
     [InlineData("09:00", "09:00")]
     [InlineData("10:00", "09:00")]

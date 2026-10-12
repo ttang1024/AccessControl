@@ -55,7 +55,7 @@ public sealed class AccessFlowTests : IDisposable
         var events = await _f.Host.Scope<AccessService, PagedResult<AccessEventView>>(s =>
             s.QueryEventsAsync(new AccessEventFilter(Granted: false), PageRequest.From(null, null), default));
         Assert.Equal(2, events.Total);
-        Assert.Equal("invalid:****card", events.Items[0].CardNumber);
+        Assert.Equal("invalid:****rd", events.Items[0].CardNumber);
     }
 
     [Fact]
@@ -74,7 +74,7 @@ public sealed class AccessFlowTests : IDisposable
         var site = await _f.SeedSiteAsync();
         Assert.True((await _f.RequestAsync(site.DoorId, site.CardNumber)).Granted);
 
-        await _f.Host.Scope<CredentialService>(s => s.RevokeAsync(site.CredentialId, default));
+        await _f.Host.Scope<CredentialService>(s => s.RevokeAsync(site.CredentialId, null, default));
 
         Assert.Equal(AccessDecisionReason.CredentialNotActive, (await _f.RequestAsync(site.DoorId, site.CardNumber)).Reason);
     }
@@ -128,7 +128,7 @@ public sealed class AccessFlowTests : IDisposable
             await _f.Host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest(name, null), default));
         }
 
-        var page = await _f.Host.Scope<DoorService, PagedResult<DoorView>>(s => s.ListAsync(PageRequest.From(1, 1), default));
+        var page = await _f.Host.Scope<DoorService, PagedResult<DoorView>>(s => s.SearchAsync(null, PageRequest.From(1, 1), default));
 
         Assert.Equal(3, page.Total);
         Assert.Equal(["Basement"], page.Items.Select(d => d.Name));
@@ -146,17 +146,50 @@ public sealed class AccessFlowTests : IDisposable
         var issued = await _f.Host.Scope<AuditService, PagedResult<ChangeAuditEntry>>(s =>
             s.QueryChangesAsync(new ChangeAuditFilter(EntityId: site.CredentialId), PageRequest.From(null, null), default));
 
-        Assert.Equal("****1234", credential.CardNumber);
-        Assert.Equal("****1234", events.Items.Single().CardNumber);
-        Assert.Equal("****1234", issued.Items.Single().After!.Value.GetProperty("cardNumber").GetString());
+        // An 8-hex-digit (32-bit) card shows two digits; see CardNumberMask.
+        Assert.Equal("****34", credential.CardNumber);
+        Assert.Equal("****34", events.Items.Single().CardNumber);
+        var after = issued.Items.Single().After!.Value;
+        Assert.False(after.TryGetProperty("cardNumber", out _));
+        Assert.Equal("34", after.GetProperty("cardNumberHint").GetString());
+    }
+
+    [Fact]
+    public async Task Card_numbers_are_never_written_to_disk()
+    {
+        var site = await _f.SeedSiteAsync();
+        await _f.RequestAsync(site.DoorId, site.CardNumber);
+        await _f.RequestAsync(site.DoorId, "DEAD:BEEF:0042");
+        _f.Host.Stop(); // checkpoint
+
+        foreach (var file in Directory.GetFiles(_f.Host.DataDirectory))
+        {
+            var text = await File.ReadAllTextAsync(file);
+            Assert.DoesNotContain("ABCD1234", text, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("DEADBEEF0042", text, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
+    public async Task Errors_never_repeat_a_card_number()
+    {
+        var site = await _f.SeedSiteAsync();
+        var other = await _f.Host.Scope<CardholderService, CardholderView>(s =>
+            s.CreateAsync(new CardholderRequest("Grace", "Hopper", null, null, null), default));
+
+        var ex = await Assert.ThrowsAsync<ConflictException>(() => _f.Host.Scope<CredentialService, CredentialView>(s =>
+            s.IssueAsync(other.Id, new IssueCredentialRequest(site.CardNumber, null), default)));
+        Assert.Equal("credential.duplicate_card_number", ex.Code);
+        Assert.DoesNotContain("ABCD1234", ex.Message.Replace(":", string.Empty, StringComparison.Ordinal), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("1234", ex.Message, StringComparison.Ordinal);
     }
 
     [Theory]
-    [InlineData("ABCD1234", "****1234")]
-    [InlineData("ABCD", "****CD")]
+    [InlineData("0123456789ABCDEF", "****CDEF")] // 64 bits and up: four digits
+    [InlineData("ABCD1234", "****34")]           // 32 bits and up: two
+    [InlineData("A1B2C3", "****")]               // 26-bit Wiegand and other short formats: none
     [InlineData("A", "****")]
-    [InlineData("invalid:", "invalid:****")]
-    public void Masking_shows_at_most_four_and_never_more_than_half(string value, string expected) =>
+    public void Masking_reveals_less_of_shorter_card_numbers(string value, string expected) =>
         Assert.Equal(expected, CardNumberMask.Mask(value));
 
     [Fact]
@@ -164,7 +197,7 @@ public sealed class AccessFlowTests : IDisposable
     {
         var site = await _f.SeedSiteAsync();
 
-        await _f.Host.Scope<AccessGroupService>(s => s.DeleteAsync(site.GroupId, default));
+        await _f.Host.Scope<AccessGroupService>(s => s.DeleteAsync(site.GroupId, null, default));
 
         var cardholder = await _f.Host.Scope<CardholderService, CardholderView>(s => s.GetAsync(site.CardholderId, default));
         Assert.Empty(cardholder.AccessGroupIds);
@@ -177,9 +210,9 @@ public sealed class AccessFlowTests : IDisposable
         var site = await _f.SeedSiteAsync();
 
         var scheduleEx = await Assert.ThrowsAsync<ConflictException>(() =>
-            _f.Host.Scope<ScheduleService>(s => s.DeleteAsync(site.ScheduleId, default)));
+            _f.Host.Scope<ScheduleService>(s => s.DeleteAsync(site.ScheduleId, null, default)));
         var doorEx = await Assert.ThrowsAsync<ConflictException>(() =>
-            _f.Host.Scope<DoorService>(s => s.DeleteAsync(site.DoorId, default)));
+            _f.Host.Scope<DoorService>(s => s.DeleteAsync(site.DoorId, null, default)));
 
         Assert.Equal("schedule.in_use", scheduleEx.Code);
         Assert.Equal("door.in_use", doorEx.Code);
@@ -191,7 +224,7 @@ public sealed class AccessFlowTests : IDisposable
         var site = await _f.SeedSiteAsync();
         await Assert.ThrowsAsync<NotFoundException>(() =>
             _f.Host.Scope<CardholderService, CardholderView>(s =>
-                s.JoinAccessGroupAsync(site.CardholderId, Guid.NewGuid(), default)));
+                s.JoinAccessGroupAsync(site.CardholderId, Guid.NewGuid(), null, default)));
     }
 }
 
@@ -220,11 +253,11 @@ internal sealed class TestHostFixture(DateTimeOffset now) : IDisposable
         var door = await Host.Scope<DoorService, DoorView>(s => s.CreateAsync(new DoorRequest("Front door", "Lobby"), default));
         var group = await Host.Scope<AccessGroupService, AccessGroupView>(s =>
             s.CreateAsync(new AccessGroupRequest("Staff", schedule.Id), default));
-        await Host.Scope<AccessGroupService, AccessGroupView>(s => s.AddDoorAsync(group.Id, door.Id, default));
+        await Host.Scope<AccessGroupService, AccessGroupView>(s => s.AddDoorAsync(group.Id, door.Id, null, default));
 
         var cardholder = await Host.Scope<CardholderService, CardholderView>(s =>
             s.CreateAsync(new CardholderRequest("Ada", "Lovelace", "E-1", null, null), default));
-        await Host.Scope<CardholderService, CardholderView>(s => s.JoinAccessGroupAsync(cardholder.Id, group.Id, default));
+        await Host.Scope<CardholderService, CardholderView>(s => s.JoinAccessGroupAsync(cardholder.Id, group.Id, null, default));
         var credential = await Host.Scope<CredentialService, CredentialView>(s =>
             s.IssueAsync(cardholder.Id, new IssueCredentialRequest(IssuedCardNumber, null), default));
 

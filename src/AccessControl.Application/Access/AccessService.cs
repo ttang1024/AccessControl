@@ -14,6 +14,7 @@ public sealed record AccessRequest(Guid DoorId, string? CardNumber);
 
 public sealed record AccessResponse(Guid EventId, bool Granted, AccessDecisionReason Reason, DateTimeOffset EvaluatedAt);
 
+/// <param name="CardNumber">Masked display form (see <see cref="CardNumberMask"/>); the number itself is never recorded.</param>
 public sealed record AccessEventView(
     Guid Id,
     DateTimeOffset OccurredAt,
@@ -25,7 +26,7 @@ public sealed record AccessEventView(
     AccessDecisionReason Reason)
 {
     public static AccessEventView From(AccessEvent e) =>
-        new(e.Id, e.OccurredAt, e.DoorId, CardNumberMask.Mask(e.CardNumber), e.CredentialId, e.CardholderId, e.Granted, e.Reason);
+        new(e.Id, e.OccurredAt, e.DoorId, e.CardDisplay, e.CredentialId, e.CardholderId, e.Granted, e.Reason);
 }
 
 public sealed partial class AccessService(
@@ -34,6 +35,7 @@ public sealed partial class AccessService(
     ICardholderRepository cardholders,
     IAccessGroupRepository accessGroups,
     IScheduleRepository schedules,
+    ICardNumberProtector protector,
     IAccessEventLog eventLog,
     AuditQueryWindow window,
     TimeProvider clock,
@@ -42,7 +44,7 @@ public sealed partial class AccessService(
     /// <summary>Meter name for <c>dotnet-counters</c> or an OpenTelemetry exporter.</summary>
     public const string MeterName = "AccessControl.Access";
 
-    /// <summary>Raw, unparseable card data is truncated to this length before it is audited.</summary>
+    /// <summary>Raw, unparseable card data is truncated to this length, then masked, before it is audited.</summary>
     private const int MaxRawCardLength = 64;
 
     private static readonly Meter Meter = new(MeterName);
@@ -65,9 +67,9 @@ public sealed partial class AccessService(
         var now = clock.GetUtcNow();
         var door = await doors.GetRequiredAsync(request.DoorId, ResourceNames.Door, ct).ConfigureAwait(false);
 
-        var parsed = CardNumber.TryParse(request.CardNumber, out var cardNumber);
-        var credential = parsed
-            ? await credentials.FindByCardNumberAsync(cardNumber, ct).ConfigureAwait(false)
+        CardFingerprint? card = CardNumber.TryParse(request.CardNumber, out var cardNumber) ? protector.Protect(cardNumber) : null;
+        var credential = card is { } presented
+            ? await credentials.FindByCardAsync(presented, ct).ConfigureAwait(false)
             : null;
 
         var cardholder = credential is null
@@ -94,7 +96,8 @@ public sealed partial class AccessService(
             Guid.NewGuid(),
             now,
             door.Id,
-            parsed ? cardNumber.Value : Sanitize(request.CardNumber),
+            card?.Digest,
+            card is { } c ? CardNumberMask.Display(c.Hint) : Sanitize(request.CardNumber),
             credential?.Id,
             cardholder?.Id,
             decision.IsGranted,
@@ -104,8 +107,8 @@ public sealed partial class AccessService(
         // surfaces as a failure, and the controller must treat any failure as a denial.
         await eventLog.AppendAsync(accessEvent, ct).ConfigureAwait(false);
 
-        // Card numbers are not logged: for most card technologies the number is all an attacker needs to
-        // clone a card, and application logs travel further than the audit log. The event id links to it.
+        // Card numbers are never logged or stored: for most card technologies the number is all an attacker needs
+        // to clone a card. The event id links this log line to the audit entry.
         Log.AccessDecided(logger, decision.IsGranted ? "granted" : "denied", door.Id, decision.Reason, accessEvent.Id);
         Decisions.Add(
             1,
@@ -130,8 +133,8 @@ public sealed partial class AccessService(
             return string.Empty;
         }
 
-        var cleaned = new string(raw.Where(c => !char.IsControl(c)).Take(MaxRawCardLength).ToArray());
-        return $"invalid:{cleaned}";
+        // Masked like a card number: unreadable input may still be most of one (e.g. a stray separator).
+        return CardNumberMask.Invalid(new string(raw.Where(c => !char.IsControl(c)).Take(MaxRawCardLength).ToArray()));
     }
 
     private static partial class Log

@@ -50,25 +50,31 @@ curl -s "$API/audit/changes" -H "$ADMIN"    # who changed what
 
 ## API
 
-All routes are under `/api/v1` and need an `X-Api-Key` header; only `GET /health` is anonymous. Errors are
-RFC 7807 problem documents with a stable `code` (for example `door.in_use` or `concurrency_conflict`).
+All routes are under `/api/v1` and need an `X-Api-Key` header; only `GET /health` is anonymous. The contract is in
+[`docs/openapi.json`](docs/openapi.json). Errors are RFC 7807 problem documents with a stable `code` (for example
+`door.in_use` or `concurrency_conflict`).
 
 | Area | Routes | Who |
 | --- | --- | --- |
-| Cardholders | `cardholders` (search `?q=`), `/{id}`, `/enable`, `/disable`, `/access-groups/{groupId}`, `/credentials` | read: Admin, Operator, Auditor · write: Admin, Operator |
+| Cardholders | `cardholders` (search `?q=&accessGroupId=`), `/{id}`, `/enable`, `/disable`, `/access-groups/{groupId}`, `/credentials` | read: Admin, Operator, Auditor · write: Admin, Operator (restricted groups: only Admin adds members) |
 | Credentials | `credentials/{id}`, `/suspend`, `/reinstate`, `/report-lost`, `/revoke`, `/expiry` | same as cardholders |
-| Doors | `doors`, `/{id}`, `/lockdown`, `/release` | read: Admin, Operator, Auditor · write and release: Admin · lockdown: Admin, Operator |
-| Schedules, groups | `schedules`, `access-groups`, `/members`, `/doors/{doorId}` | read: Admin, Operator, Auditor · write: Admin |
+| Doors | `doors` (`?q=`), `/{id}`, `/{id}/lockdown`, `/{id}/release`, site-wide `POST doors/lockdown` and `POST doors/release` | read: Admin, Operator, Auditor · write and release: Admin · lockdown: Admin, Operator |
+| Schedules, groups | `schedules`, `access-groups` (`?q=`, `restricted`), `/members`, `/doors/{doorId}` | read: Admin, Operator, Auditor · write: Admin |
 | Badge reads | `POST access/requests` `{doorId, cardNumber}` → `{eventId, granted, evaluatedAt}` | DoorController, assigned doors only |
 | Audit | `access/events`, `audit/changes`, `audit/verify` | Admin, Auditor |
 
+- Every resource has a `version`, sent as the `ETag` header. Send it back as `If-Match` when you change the
+  resource: if someone changed it since you read it, you get `412 precondition_failed` instead of overwriting
+  their change. (`If-Match` is optional.)
 - Every list (cardholders, doors, schedules, groups, members, audit) takes `offset` and `limit` (max 500) and
   returns `{items, total, offset, limit}`. Audit results are newest first. Audit queries without `from`
   cover the last 30 days before `to` (or now), set by `AuditQuery:DefaultDays`; pass `from` to look further back.
   They accept an `offset` of at most 10,000; to go further back, narrow `from` and `to`.
 - Doors and schedules can't be deleted while a group uses them. This holds even under concurrent requests: the
   store checks references when it commits.
-- Responses never contain a full card number: they show at most the last four characters (`****2C3D`).
+- Card numbers are never stored, only a keyed fingerprint (`Storage:CardNumberKey`) and a short hint. Responses
+  show at most the hint: four hex digits for 64-bit and longer numbers, two for 32-bit, none for shorter formats
+  such as 26-bit Wiegand (`****`), because there the last digits are most of the card.
 - A request that changes nothing (e.g. locking down a door that is already locked down) writes nothing.
 - Cardholders and cards are never deleted: disable or revoke them instead.
 - **Controllers must treat any non-200 response as a deny.** The response deliberately leaves out the deny
@@ -78,7 +84,8 @@ RFC 7807 problem documents with a stable `code` (for example `door.in_use` or `c
 
 Use environment variables (`Auth__ApiKeys__0__Sha256`) or a secret store for anything secret.
 
-**API keys:** create a key with `openssl rand -base64 32` and store only its hash (`printf '%s' "$KEY" | shasum -a 256`):
+**API keys:** create a key with `openssl rand -base64 32` and store only its hash (`printf '%s' "$KEY" | shasum -a
+256`):
 
 ```json
 "Auth": {
@@ -90,15 +97,21 @@ Use environment variables (`Auth__ApiKeys__0__Sha256`) or a secret store for any
 ```
 
 - Roles are `Admin`, `Operator`, `Auditor` and `DoorController`.
+- Keys are read at startup: restart the service to add or rotate one.
 - `Name` is recorded in the change log, so it must be unique.
 - Give each controller its own key, listing only the doors it serves.
 - Unsafe key settings stop startup.
 - Outside Development, a key sent over plain HTTP is rejected (`Auth:RequireHttps`). Replace that key, since it
   crossed the network unencrypted.
 
+Give every person their own key: the change log records the key's name, so a shared key hides who changed what.
+
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `Storage:DataDirectory` | `data` | `store.json` and the audit logs. Back it up. |
+| `Storage:DataDirectory` | `data` | `store.json` and the audit logs. Back it up. One instance per directory: a second one fails at startup, so deploy stop-then-start, not rolling. |
+| `Storage:CardNumberKey` | none | Keys the card fingerprints. Required outside Development (32+ characters, not the same as `AuditHmacKey`). Changing it makes every enrolled card unknown. |
+| `Storage:CheckpointEveryCommits` | 100 | Commits are durable in `changes.jsonl`; `store.json` is a checkpoint written this often and at shutdown, and startup replays the rest. |
+
 | `Storage:AuditHmacKey` | none | Signs the audit hash chain. Required outside Development (32+ characters). Set it before first start; changing it breaks verification of older entries. |
 | `Storage:AuditSegmentMaxBytes` | 64 MB | Audit log rotation size. |
 | `Storage:AuditRetentionDays` | keep forever | Delete rotated audit files older than this. |
@@ -106,18 +119,20 @@ Use environment variables (`Auth__ApiKeys__0__Sha256`) or a secret store for any
 | `AuditQuery:DefaultDays` | 30 | How far back `access/events` and `audit/changes` look when no `from` is given. |
 | `RateLimiting:DoorControllerPermitsPerMinute` | 120 | Per controller key. A throttled read is a denied entry, so size it above peak. |
 | `RateLimiting:UserPermitsPerMinute` | 600 | Per Admin, Operator or Auditor key. |
-| `RateLimiting:AnonymousPermitsPerMinute` | 60 | Per client IP, for requests with no key or a wrong key; `/health*` has its own budget of the same size. |
+| `RateLimiting:AnonymousPermitsPerMinute` | 60 | Per client IP (IPv6: per /64), for requests with no key or a wrong key; `/health*` has its own budget of the same size. Windows slide. |
+
 | `AllowedHosts` | `*` | Must list the real host name(s) outside Development, or startup fails. |
 
 ## Audit trail
 
 - `access-events*.jsonl` records every badge read with its reason.
-- `changes*.jsonl` records every configuration change: who made it, and the record before and after. Each entry
-  is written before the change takes effect.
+- `changes*.jsonl` records every configuration change: who made it, and the record before and after. Writing the
+  entry *is* the commit, so a change and its record can never disagree.
 - Both logs are hash-chained. `GET /api/v1/audit/verify` reports any entry that was edited, removed, inserted or
   reordered, and any oldest entries removed other than by retention (which leaves a signed anchor).
-- The chain can't show that its newest entries were removed while the service was stopped. Record each report's
-  `lastSequence` and `lastHash` off the host and alert if a later report goes backwards.
+- The chain can't show that its newest entries were removed while the service was stopped, or that someone with root
+  (and so the HMAC key) rewrote it. Record each `audit/verify` report's `lastSequence` and `lastHash` off the host and
+  alert if a later report goes backwards.
 - The chain can't stop someone with root on the host from deleting files, so copy the logs off the host.
 
 ## Before going live
@@ -126,16 +141,19 @@ Use environment variables (`Auth__ApiKeys__0__Sha256`) or a secret store for any
       when the API is unreachable.
 - [ ] TLS is on all the way to the API. Behind a TLS proxy, set `ASPNETCORE_FORWARDEDHEADERS_ENABLED=true`, but
       only if the API can be reached through that proxy alone.
-- [ ] `ASPNETCORE_ENVIRONMENT` is not `Development`, `AllowedHosts` is set, and `AuditHmacKey` and API keys come
-      from a secret store.
+- [ ] `ASPNETCORE_ENVIRONMENT` is not `Development`, `AllowedHosts` is set, and `AuditHmacKey`, `CardNumberKey` and
+      API keys come from a secret store. Every person has their own key.
+- [ ] Exactly one instance per data volume, deployed stop-then-start.
 - [ ] Monitoring covers `/health` and `/health/live`, `audit/verify` (with the chain head stored off-host), the
-      `AccessControl.Access` metrics, log events 4000 (key sent over HTTP) and 4001 (controller used
-      an unassigned door), and 429 responses to controllers.
+      `AccessControl.Access` metrics, log events 4000 (key sent over HTTP), 4001 (controller used an unassigned door),
+      3105 (altered audit line), a rising rate of unknown-card denials, and 429 responses to controllers.
 - [ ] The data directory is backed up and the audit logs are copied off the host.
 
 A `Dockerfile` (non-root, data in `/data`) and a CI workflow (`.github/workflows/ci.yml`) are included.
 
 This runs as a single instance, sized for tens of thousands of configuration records. To scale out, put the
-interfaces in `src/AccessControl.Application/Abstractions/` on a database.
+interfaces in `src/AccessControl.Application/Abstractions/` on a database. Why it is built this way, and when to
+change that: [`docs/adr/0001`](docs/adr/0001-file-backed-store-and-audit-logs.md) (storage) and
+[`docs/adr/0002`](docs/adr/0002-online-decisions-and-controller-outages.md) (online decisions, controller outages).
 
 Contributors: see [CLAUDE.md](CLAUDE.md) for the architecture and design rules.

@@ -3,8 +3,10 @@ using AccessControl.Domain.Common;
 namespace AccessControl.Domain.Credentials;
 
 /// <summary>
-/// The identifier a reader sends for a card. Stored in a canonical form
-/// (upper-case hexadecimal, no separators) so that "0a:1b" and "0A1B" match.
+/// The identifier a reader sends for a card, in a canonical form (upper-case hexadecimal, no separators) so that
+/// "0a:1b" and "0A1B" match. Leading zeros are kept: readers send a fixed number of bits per card format, so "000A1B"
+/// and "0A1B" may be different cards, and treating them as one could let a card open another's doors. A reader that
+/// sends the same card with a different width is misconfigured; its reads are denied and audited as unknown cards.
 /// </summary>
 public readonly record struct CardNumber
 {

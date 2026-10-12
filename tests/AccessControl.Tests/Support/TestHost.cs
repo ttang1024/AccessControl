@@ -82,4 +82,6 @@ internal sealed class TestHost : IDisposable
 internal sealed class TestActor : IActorContext
 {
     public string Actor { get; set; } = "test";
+
+    public bool CanGrantRestrictedAccess { get; set; } = true;
 }

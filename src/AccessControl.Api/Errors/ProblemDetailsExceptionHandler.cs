@@ -19,6 +19,8 @@ internal sealed class ProblemDetailsExceptionHandler(IProblemDetailsService prob
             DomainException e => (StatusCodes.Status409Conflict, "Operation not allowed in current state", e.Code),
             RequestValidationException e => (StatusCodes.Status400BadRequest, "Invalid request", e.Code),
             NotFoundException e => (StatusCodes.Status404NotFound, "Not found", e.Code),
+            ForbiddenException e => (StatusCodes.Status403Forbidden, "Forbidden", e.Code),
+            PreconditionFailedException e => (StatusCodes.Status412PreconditionFailed, "Precondition failed", e.Code),
             ConflictException e => (StatusCodes.Status409Conflict, "Conflict", e.Code),
             BadHttpRequestException e => (e.StatusCode, "Bad request", "request.malformed"),
             _ => null,

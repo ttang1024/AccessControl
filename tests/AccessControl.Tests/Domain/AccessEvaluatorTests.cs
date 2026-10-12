@@ -31,7 +31,7 @@ public sealed class AccessEvaluatorTests
         _group.AddDoor(_door.Id);
         _cardholder.JoinAccessGroup(_group.Id);
 
-        _credential = Credential.Issue(Guid.NewGuid(), _cardholder.Id, CardNumber.Parse("C0FFEE"), Now.AddDays(-1), null);
+        _credential = Credential.Issue(Guid.NewGuid(), _cardholder.Id, CardFingerprint.Create(new string('C', CardFingerprint.DigestLength), ""), Now.AddDays(-1), null);
     }
 
     private AccessDecision Evaluate(

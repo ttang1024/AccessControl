@@ -76,6 +76,7 @@ internal sealed class ApiFactory(Dictionary<string, string?>? overrides = null, 
         settings["Storage:FlushAuditToDisk"] = "false";
         settings["Storage:MinimumFreeDiskBytes"] = "1";
         settings["Storage:AuditHmacKey"] = "test-audit-hmac-key-0123456789abcdef";
+        settings["Storage:CardNumberKey"] = "test-card-number-key-0123456789abcdef";
         settings["AllowedHosts"] = "localhost";
         foreach (var (key, value) in overrides ?? [])
         {
@@ -89,9 +90,28 @@ internal sealed class ApiFactory(Dictionary<string, string?>? overrides = null, 
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        if (disposing && Directory.Exists(DataDirectory))
+        if (disposing)
         {
-            Directory.Delete(DataDirectory, recursive: true);
+            DeleteDataDirectory();
+        }
+    }
+
+    /// <summary>
+    /// The app's own thread disposes its services (writing the store's final checkpoint) just after the factory has
+    /// stopped the host, so the directory can still be written to for a moment: retry briefly.
+    /// </summary>
+    private void DeleteDataDirectory()
+    {
+        for (var attempt = 1; Directory.Exists(DataDirectory); attempt++)
+        {
+            try
+            {
+                Directory.Delete(DataDirectory, recursive: true);
+            }
+            catch (IOException) when (attempt < 20)
+            {
+                Thread.Sleep(50);
+            }
         }
     }
 }

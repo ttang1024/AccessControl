@@ -10,4 +10,10 @@ internal static class StorageJson
     {
         Converters = { new JsonStringEnumConverter() },
     };
+
+    /// <summary>
+    /// The serialised name of a record property, for code that reads stored JSON directly (e.g. store constraints).
+    /// Pass <c>nameof(Record.Property)</c>, so renaming the property is a compile error rather than a silent mismatch.
+    /// </summary>
+    public static string PropertyName(string clrName) => Options.PropertyNamingPolicy!.ConvertName(clrName);
 }

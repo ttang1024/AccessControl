@@ -9,7 +9,7 @@ public sealed class CredentialTests
     private static readonly DateTimeOffset IssuedAt = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
     private static Credential NewCredential(DateTimeOffset? expiresAt = null) =>
-        Credential.Issue(Guid.NewGuid(), Guid.NewGuid(), CardNumber.Parse("ABC123"), IssuedAt, expiresAt);
+        Credential.Issue(Guid.NewGuid(), Guid.NewGuid(), CardFingerprint.Create(new string('A', CardFingerprint.DigestLength), ""), IssuedAt, expiresAt);
 
     [Fact]
     public void New_credential_is_active()

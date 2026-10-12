@@ -33,6 +33,20 @@ public sealed class StorageOptions
     /// </summary>
     public int? AuditRetentionDays { get; set; }
 
+    /// <summary>
+    /// Secret for the card-number fingerprints. Card numbers are never stored: credentials and access events keep an
+    /// HMAC-SHA256 of the canonical number (for lookup and uniqueness) plus at most its last few digits (for display).
+    /// Required outside Development. Changing it makes every enrolled card unknown, so keep it in a secret store and
+    /// never rotate it without re-enrolling cards.
+    /// </summary>
+    public string? CardNumberKey { get; set; }
+
+    /// <summary>
+    /// The store is checkpointed to <c>store.json</c> every this many commits (and at shutdown). Commits in between
+    /// are durable in the change log and replayed from it at startup.
+    /// </summary>
+    public int CheckpointEveryCommits { get; set; } = 100;
+
     /// <summary>The health check reports unhealthy below this much free space on the data volume.</summary>
     public long MinimumFreeDiskBytes { get; set; } = 1024L * 1024 * 1024;
 }

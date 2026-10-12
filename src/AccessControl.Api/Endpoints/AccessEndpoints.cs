@@ -46,7 +46,7 @@ internal static partial class AccessEndpoints
         // Checked before the door is looked up, so a controller cannot discover which other doors exist.
         if (!user.MayUseDoor(body.DoorId))
         {
-            Log.DoorNotAssigned(loggers.CreateLogger(typeof(AccessEndpoints)), user.Identity?.Name ?? "unknown", body.DoorId);
+            Log.DoorNotAssigned(loggers.CreateLogger(typeof(AccessEndpoints)), user.ActorName() ?? "unknown", body.DoorId);
             return TypedResults.Problem(
                 statusCode: StatusCodes.Status403Forbidden,
                 title: "Forbidden",

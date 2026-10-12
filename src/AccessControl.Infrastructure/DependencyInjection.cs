@@ -1,4 +1,5 @@
 using AccessControl.Application.Abstractions;
+using AccessControl.Application.Credentials;
 using AccessControl.Infrastructure.Persistence;
 using AccessControl.Infrastructure.Storage;
 using Microsoft.Extensions.Configuration;
@@ -15,13 +16,18 @@ public static class DependencyInjection
             .Bind(configuration.GetSection(StorageOptions.SectionName))
             .Validate(o => !string.IsNullOrWhiteSpace(o.DataDirectory), "Storage:DataDirectory is required.")
             .Validate(o => o.AuditRetentionDays is null or > 0, "Storage:AuditRetentionDays must be positive when set.")
+            .Validate(o => o.CheckpointEveryCommits > 0, "Storage:CheckpointEveryCommits must be positive.")
             .ValidateOnStart();
+
+        services.AddSingleton<DataDirectoryLock>();
 
         services.AddSingleton(StoreConstraints.CardNumber);
         foreach (var foreignKey in StoreConstraints.ForeignKeys)
         {
             services.AddSingleton(foreignKey);
         }
+
+        services.AddSingleton<ICardNumberProtector, CardNumberProtector>();
 
         services.AddSingleton<JsonLinesChangeLog>();
         services.AddSingleton<IChangeAuditLog>(sp => sp.GetRequiredService<JsonLinesChangeLog>());
@@ -37,6 +43,9 @@ public static class DependencyInjection
         services.AddScoped<IDoorRepository, DoorRepository>();
         services.AddScoped<IScheduleRepository, ScheduleRepository>();
         services.AddScoped<IAccessGroupRepository, AccessGroupRepository>();
+
+        // Runs only under a host (the API); tests that build a bare container open storage lazily.
+        services.AddHostedService<StorageStartup>();
 
         services.AddHealthChecks().AddCheck<StorageHealthCheck>("storage");
         return services;

@@ -15,7 +15,7 @@ public sealed partial class ApiKeyAuthenticationHandler(
     IOptionsMonitor<AuthenticationSchemeOptions> options,
     ILoggerFactory logger,
     UrlEncoder encoder,
-    IOptionsMonitor<ApiKeyOptions> keys)
+    IOptions<ApiKeyOptions> keys)
     : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
 {
     public const string SchemeName = "ApiKey";
@@ -28,7 +28,8 @@ public sealed partial class ApiKeyAuthenticationHandler(
             return Task.FromResult(AuthenticateResult.NoResult());
         }
 
-        var settings = keys.CurrentValue;
+        // Read once at startup (validated by ApiKeyOptionsValidator); rotate keys by restarting.
+        var settings = keys.Value;
         if (settings.RequireHttps && !Request.IsHttps)
         {
             // The key has already crossed the network in the clear; refuse it so the mistake is noticed.
